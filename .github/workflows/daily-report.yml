@@ -1,0 +1,55 @@
+name: Ежедневный отчёт по заказам WB+Ozon
+
+on:
+  schedule:
+    - cron: "0 5 * * *"   # 05:00 UTC = 08:00 МСК
+  workflow_dispatch:        # кнопка ручного запуска
+
+permissions:
+  contents: write           # чтобы коммитить накопленную историю обратно
+
+concurrency:
+  group: daily-report
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Зависимости
+        run: pip install PyJWT cryptography pillow openpyxl
+
+      - name: Секреты -> файлы
+        run: |
+          printf '%s' "${{ secrets.API_KEYS_FILE }}" > api_keys.txt
+          printf '%s' "${{ secrets.GOOGLE_SA_JSON }}" > google_sa.json
+
+      - name: Конвейер по всем брендам
+        env:
+          TIME_BUDGET: "86400"
+        run: python3 scripts/run_all.py
+
+      - name: Сохранить историю (коммит state/)
+        if: always()
+        run: |
+          rm -f api_keys.txt google_sa.json
+          git config user.name "report-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add state/
+          git diff --cached --quiet || git commit -m "история за $(date -u +%F)"
+          git push
+
+      - name: Excel-файлы как артефакт
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports
+          path: reports/*.xlsx
+          retention-days: 14

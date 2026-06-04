@@ -6,7 +6,7 @@
 Бренды без каких-то ключей/настроек пропускают соответствующие шаги.
 Коды выхода: 0 — все бренды ок, 1 — есть ошибки (см. лог).
 """
-import json, os, re, subprocess, sys
+import json, os, re, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -24,15 +24,17 @@ for line in open(KEYS, encoding="utf-8"):
         k, v = line.split("=", 1); K[k] = v.strip()
 
 def run_until_done(args, max_runs=60):
-    """Скрипты резюмируемые и печатают DONE в конце."""
+    """Скрипты резюмируемые и печатают DONE в конце.
+    При 429/PROGRESS ждём перед повтором — иначе ретраи сгорают за секунды."""
     for i in range(max_runs):
         r = subprocess.run(args, capture_output=True, text=True)
         out = (r.stdout + r.stderr).strip()
-        if out: print(out[-2000:])
+        if out: print(out[-2000:], flush=True)
         if r.returncode != 0:
             return False
         if "DONE" in out:
             return True
+        time.sleep(60 if "429" in out else 25)
     return False
 
 failed = []

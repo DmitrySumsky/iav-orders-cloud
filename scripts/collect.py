@@ -97,8 +97,8 @@ def main():
                 d = http("https://seller-analytics-api.wildberries.ru/api/analytics/v3/sales-funnel/products/history",
                          WB_H, body, timeout=60)
             except urllib.error.HTTPError as e:
-                if e.code == 429:
-                    print("WB 429 — перезапусти через минуту"); return
+                if e.code == 429 or e.code >= 500:
+                    print(f"WB {e.code} — перезапусти через минуту"); return
                 print("WB funnel ERR", e.code, e.read()[:200]); sys.exit(1)
             payload = d.get("data", d) if isinstance(d, dict) else d
             for prod in (payload if isinstance(payload, list) else payload.get("products", [])):
@@ -136,9 +136,9 @@ def main():
                     d = http("https://seller-analytics-api.wildberries.ru/api/analytics/v3/sales-funnel/products",
                              WB_H, body, timeout=60)
                 except urllib.error.HTTPError as e:
-                    if e.code == 429:
+                    if e.code == 429 or e.code >= 500:
                         S["wb_o14_partial"] = orders; save()
-                        print("WB 429 — перезапусти через минуту"); return
+                        print(f"WB {e.code} — перезапусти через минуту"); return
                     raise
                 got = set()
                 for p in d.get("data", {}).get("products", []):

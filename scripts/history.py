@@ -109,7 +109,8 @@ if wb_token and S.get("has_wb"):
             try:
                 d = http(URL_HIST, WB_H, body)
             except urllib.error.HTTPError as e:
-                if e.code == 429: print("WB 429 — перезапусти через минуту"); sys.exit(0)
+                if e.code == 429 or e.code >= 500:
+                    print(f"WB {e.code} — перезапусти через минуту"); sys.exit(0)
                 print("WB ERR", e.code, e.read()[:200]); sys.exit(1)
             payload = d.get("data", d) if isinstance(d, dict) else d
             for prod in (payload if isinstance(payload, list) else payload.get("products", [])):
@@ -144,7 +145,8 @@ if wb_token and S.get("has_wb"):
             try:
                 d = http(URL_PROD, WB_H, body)
             except urllib.error.HTTPError as e:
-                if e.code == 429: print("WB 429 — перезапусти через минуту"); sys.exit(0)
+                if e.code == 429 or e.code >= 500:
+                    print(f"WB {e.code} — перезапусти через минуту"); sys.exit(0)
                 print("WB ERR", e.code, e.read()[:200]); sys.exit(1)
             for p_ in d.get("data", {}).get("products", []):
                 nmid = str((p_.get("product") or {}).get("nmId") or "")

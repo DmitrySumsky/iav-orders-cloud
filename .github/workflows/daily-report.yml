@@ -27,14 +27,18 @@ jobs:
         run: pip install PyJWT cryptography pillow openpyxl
 
       - name: Секреты -> файлы
+        env:
+          API_KEYS: ${{ secrets.API_KEYS_FILE }}
+          SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
         run: |
-          printf '%s' "${{ secrets.API_KEYS_FILE }}" > api_keys.txt
-          printf '%s' "${{ secrets.GOOGLE_SA_JSON }}" > google_sa.json
+          printf '%s' "$API_KEYS" > api_keys.txt
+          printf '%s' "$SA_JSON" > google_sa.json
+          python3 -c "import json; json.load(open('google_sa.json')); print('SA JSON валиден')"
 
       - name: Конвейер по всем брендам
         env:
           TIME_BUDGET: "86400"
-        run: python3 scripts/run_all.py
+        run: python3 -u scripts/run_all.py
 
       - name: Сохранить историю (коммит state/)
         if: always()

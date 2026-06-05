@@ -2,7 +2,7 @@ name: Ежедневный отчёт по заказам WB+Ozon
 
 on:
   schedule:
-    - cron: "0 5 * * *"   # 05:00 UTC = 08:00 МСК
+    - cron: "23 5 * * *"   # 05:23 UTC = 08:23 МСК
   workflow_dispatch:        # кнопка ручного запуска
 
 permissions:

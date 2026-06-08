@@ -56,10 +56,26 @@ H = json.load(open(hist_f)) if os.path.exists(hist_f) else \
     {"data": {}, "wb_done": [], "wb_dates": [], "oz_dates": []}
 def save(): json.dump(H, open(hist_f, "w"), ensure_ascii=False)
 
-def http(url, headers=None, body=None, timeout=60):
+def http(url, headers=None, body=None, timeout=60, _tries=6):
+    # Автоповтор при 429/5xx и сетевых сбоях: один IP GitHub упирается в
+    # rate-limit WB/Ozon, когда бренды идут подряд. Ждём и повторяем.
     req = urllib.request.Request(url, data=body, headers=headers or {})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read())
+    for attempt in range(_tries):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 500, 502, 503, 504) and attempt < _tries - 1:
+                wait = 0
+                try: wait = int(e.headers.get("Retry-After", 0))
+                except Exception: wait = 0
+                time.sleep(wait or min(60, 5 * (2 ** attempt)))
+                continue
+            raise
+        except urllib.error.URLError:
+            if attempt < _tries - 1:
+                time.sleep(5 * (2 ** attempt)); continue
+            raise
 
 def add(art_base, day, platform, n):
     d = H["data"].setdefault(art_base, {}).setdefault(day, {"wb": 0, "oz": 0})

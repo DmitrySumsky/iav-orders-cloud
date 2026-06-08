@@ -38,9 +38,12 @@ def run_until_done(args, max_runs=60):
     return False
 
 failed = []
-for brand in [b.strip() for b in BRANDS if b.strip()]:
+brand_list = [b.strip() for b in BRANDS if b.strip()]
+for idx, brand in enumerate(brand_list):
     prefix = re.sub(r"[^A-Z0-9]", "", brand.upper())
-    print(f"\n=== {brand} ===")
+    if idx > 0:
+        time.sleep(45)  # пауза между брендами — дать API «остыть» (один IP GitHub)
+    print(f"\n=== {brand} ===", flush=True)
     has_keys = K.get(f"{prefix}_WB_TOKEN") or (K.get(f"{prefix}_OZON_CLIENT_ID") and K.get(f"{prefix}_OZON_API_KEY"))
     if not has_keys:
         print("нет ключей — пропуск"); continue

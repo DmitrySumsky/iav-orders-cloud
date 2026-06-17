@@ -51,7 +51,9 @@ if S.get("has_wb"):
         wb_rows.append({"art": c["vendorCode"], "nm": c["nmID"],
             "o_y": y.get("orders", 0), "o_p": pp.get("orders", 0),
             "v_y": y.get("open", 0),   "v_p": pp.get("open", 0),
-            "c_y": y.get("cart", 0),   "c_p": pp.get("cart", 0)})
+            "c_y": y.get("cart", 0),   "c_p": pp.get("cart", 0),
+            "rev_y": y.get("orderSum", 0),
+            "cp": (S.get("wb_client_price") or {}).get(str(c["nmID"]))})
     wb_rows.sort(key=lambda r: -r["o_y"])
 if S.get("has_oz"):
     for sku, v in (S.get("ozon") or {}).items():
@@ -62,7 +64,9 @@ if S.get("has_oz"):
             "o_y": y.get("orders", 0),    "o_p": pp.get("orders", 0),
             "sh_y": y.get("view", 0),     "sh_p": pp.get("view", 0),
             "cl_y": y.get("view_pdp", 0), "cl_p": pp.get("view_pdp", 0),
-            "c_y": y.get("tocart", 0),    "c_p": pp.get("tocart", 0)})
+            "c_y": y.get("tocart", 0),    "c_p": pp.get("tocart", 0),
+            "rev_y": y.get("revenue", 0),
+            "cp": (S.get("oz_client_price") or {}).get(str(sku))})
     oz_rows.sort(key=lambda r: -r["o_y"])
 agg = {}
 for row in wb_rows:
@@ -157,58 +161,92 @@ def push_sheet(title, header, total_row, data_rows, delta_cols, pct_cols, n_cols
                 "format": {"backgroundColor": RED_BG, "textFormat": {"foregroundColor": RED_FG}}}}, "index": 0}})
     api(f"{BASE}:batchUpdate", {"requests": reqs})
 
-if wb_rows:
-    header = ["Артикул", "nmID", f"Заказы вчера ({Y_L})", f"Заказы позавчера ({P_L})", "Δ заказы", "Δ %",
-              "Переходы в карточку вчера", "Переходы позавчера", "Δ переходы",
-              "Корзины вчера", "Корзины позавчера", "Δ корзины"]
-    last = 2 + len(wb_rows)
-    total = ["ИТОГО WB", "", f"=SUM(C3:C{last})", f"=SUM(D3:D{last})", "=C2-D2",
-             "=IF(D2=0;\"\";(C2-D2)/D2)", f"=SUM(G3:G{last})", f"=SUM(H3:H{last})", "=G2-H2",
-             f"=SUM(J3:J{last})", f"=SUM(K3:K{last})", "=J2-K2"]
-    rows = []
-    for i, r in enumerate(wb_rows, 3):
-        rows.append([r["art"], r["nm"], r["o_y"], r["o_p"], f"=C{i}-D{i}",
-                     f"=IF(D{i}=0;\"\";(C{i}-D{i})/D{i})", r["v_y"], r["v_p"], f"=G{i}-H{i}",
-                     r["c_y"], r["c_p"], f"=J{i}-K{i}"])
-    push_sheet("WB", header, total, rows, [4, 8, 11], [5], 12,
-               [300, 95, 105, 115, 85, 75, 115, 105, 95, 100, 110, 90])
-    print(f"WB: {len(rows)} строк")
-
-if oz_rows:
-    header = ["Артикул", "SKU Ozon", f"Заказы вчера ({Y_L})", f"Заказы позавчера ({P_L})", "Δ заказы", "Δ %",
-              "Показы вчера", "Показы позавчера", "Δ показы",
-              "Просмотры карточки вчера", "Просмотры позавчера", "Δ просмотры",
-              "Корзины вчера", "Корзины позавчера", "Δ корзины"]
-    last = 2 + len(oz_rows)
-    total = ["ИТОГО Ozon", "", f"=SUM(C3:C{last})", f"=SUM(D3:D{last})", "=C2-D2",
-             "=IF(D2=0;\"\";(C2-D2)/D2)", f"=SUM(G3:G{last})", f"=SUM(H3:H{last})", "=G2-H2",
-             f"=SUM(J3:J{last})", f"=SUM(K3:K{last})", "=J2-K2",
-             f"=SUM(M3:M{last})", f"=SUM(N3:N{last})", "=M2-N2"]
-    rows = []
-    for i, r in enumerate(oz_rows, 3):
-        rows.append([r["art"], int(r["sku"]), r["o_y"], r["o_p"], f"=C{i}-D{i}",
-                     f"=IF(D{i}=0;\"\";(C{i}-D{i})/D{i})", r["sh_y"], r["sh_p"], f"=G{i}-H{i}",
-                     r["cl_y"], r["cl_p"], f"=J{i}-K{i}", r["c_y"], r["c_p"], f"=M{i}-N{i}"])
-    push_sheet("Ozon", header, total, rows, [4, 8, 11, 14], [5], 15,
-               [300, 105, 105, 115, 85, 75, 105, 115, 95, 115, 110, 100, 100, 110, 90])
-    print(f"Ozon: {len(rows)} строк")
-
-# история прошлых дней (даты старше позавчера, от свежих к старым)
+# история заказов по дням (для листов WB / Ozon / Общее)
 hist_dates, hist = [], {}
 if a.history and os.path.exists(a.history):
     HF = json.load(open(a.history))
     hist = HF.get("data", {})
     all_dates = sorted(set(HF.get("wb_dates", [])) | set(HF.get("oz_dates", [])), reverse=True)
     hist_dates = [d for d in all_dates if d < P]
-
-def hval(base, day):
-    rec = hist.get(base, {}).get(day)
-    return (rec.get("wb", 0) + rec.get("oz", 0)) if rec else 0
-
-def col_letter(n):  # 1 -> A
+def col_letter(n):
     s = ""
     while n: n, r = divmod(n - 1, 26); s = chr(65 + r) + s
     return s
+def hday(base, day, plat):
+    rec = hist.get(base, {}).get(day)
+    return rec.get(plat, 0) if rec else 0
+def hval(base, day):
+    rec = hist.get(base, {}).get(day)
+    return (rec.get("wb", 0) + rec.get("oz", 0)) if rec else 0
+HDATES = [ddmm(d) for d in hist_dates]
+
+def heatmap(title, start_col, ncols, last_row):
+    # Тепловая подсветка истории — ПО КАЖДОЙ СТРОКЕ отдельно (свой min/max),
+    # чтобы видеть динамику товара по дням, а не сравнивать крупные с мелкими.
+    if ncols <= 0 or last_row < 3: return
+    try:  # подсветка — косметика, её сбой не должен прерывать выгрузку данных
+        sid = ensure_sheet(title)
+        reqs = []
+        for row in range(2, last_row):  # 0-индекс: строки данных с 3-й (индекс 2)
+            reqs.append({"addConditionalFormatRule": {"rule": {
+                "ranges": [{"sheetId": sid, "startRowIndex": row, "endRowIndex": row + 1,
+                            "startColumnIndex": start_col, "endColumnIndex": start_col + ncols}],
+                "gradientRule": {"minpoint": {"color": {"red": 1, "green": 1, "blue": 1}, "type": "MIN"},
+                                 "maxpoint": {"color": {"red": 0.388, "green": 0.745, "blue": 0.482}, "type": "MAX"}}},
+                "index": 0}})
+        for i in range(0, len(reqs), 200):
+            api(f"{BASE}:batchUpdate", {"requests": reqs[i:i+200]})
+    except Exception as e:
+        print(f"  (подсветка {title} пропущена: {str(e)[:80]})")
+
+if wb_rows:
+    header = ["Артикул", "SKU", f"Заказы вчера ({Y_L})", f"Заказы позавчера ({P_L})", "Δ заказы", "Δ %",
+              "Переходы в карточку вчера", "Переходы позавчера", "Δ переходы",
+              "Корзины вчера", "Корзины позавчера", "Δ корзины"] + HDATES
+    last = 2 + len(wb_rows)
+    total = ["ИТОГО WB", "", f"=SUM(C3:C{last})", f"=SUM(D3:D{last})", "=C2-D2",
+             "=IF(D2=0;\"\";(C2-D2)/D2)", f"=SUM(G3:G{last})", f"=SUM(H3:H{last})", "=G2-H2",
+             f"=SUM(J3:J{last})", f"=SUM(K3:K{last})", "=J2-K2"]
+    for j in range(len(hist_dates)):
+        L = col_letter(13 + j)
+        total.append(f"=SUM({L}3:{L}{last})")
+    rows = []
+    for i, r in enumerate(wb_rows, 3):
+        base = base_art(r["art"], MAP)
+        rows.append([r["art"], r["nm"], r["o_y"], r["o_p"], f"=C{i}-D{i}",
+                     f"=IF(D{i}=0;\"\";(C{i}-D{i})/D{i})", r["v_y"], r["v_p"], f"=G{i}-H{i}",
+                     r["c_y"], r["c_p"], f"=J{i}-K{i}"]
+                    + [hday(base, d, "wb") for d in hist_dates])
+    push_sheet("WB", header, total, rows, [4, 8, 11], [5], 12 + len(hist_dates),
+               [300, 95, 105, 115, 85, 75, 115, 105, 95, 100, 110, 90] + [60] * len(hist_dates))
+    heatmap("WB", 12, len(hist_dates), 2 + len(wb_rows))
+    print(f"WB: {len(rows)} строк, история {len(hist_dates)} дн")
+
+if oz_rows:
+    header = ["Артикул", "SKU Ozon", f"Заказы вчера ({Y_L})", f"Заказы позавчера ({P_L})", "Δ заказы", "Δ %",
+              "Показы вчера", "Показы позавчера", "Δ показы",
+              "Просмотры карточки вчера", "Просмотры позавчера", "Δ просмотры",
+              "Корзины вчера", "Корзины позавчера", "Δ корзины"]
+    header = header + HDATES
+    last = 2 + len(oz_rows)
+    total = ["ИТОГО Ozon", "", f"=SUM(C3:C{last})", f"=SUM(D3:D{last})", "=C2-D2",
+             "=IF(D2=0;\"\";(C2-D2)/D2)", f"=SUM(G3:G{last})", f"=SUM(H3:H{last})", "=G2-H2",
+             f"=SUM(J3:J{last})", f"=SUM(K3:K{last})", "=J2-K2",
+             f"=SUM(M3:M{last})", f"=SUM(N3:N{last})", "=M2-N2"]
+    for j in range(len(hist_dates)):
+        L = col_letter(16 + j)
+        total.append(f"=SUM({L}3:{L}{last})")
+    rows = []
+    for i, r in enumerate(oz_rows, 3):
+        base = base_art(r["art"], MAP)
+        rows.append([r["art"], int(r["sku"]), r["o_y"], r["o_p"], f"=C{i}-D{i}",
+                     f"=IF(D{i}=0;\"\";(C{i}-D{i})/D{i})", r["sh_y"], r["sh_p"], f"=G{i}-H{i}",
+                     r["cl_y"], r["cl_p"], f"=J{i}-K{i}", r["c_y"], r["c_p"], f"=M{i}-N{i}"]
+                    + [hday(base, d, "oz") for d in hist_dates])
+    push_sheet("Ozon", header, total, rows, [4, 8, 11, 14], [5], 15 + len(hist_dates),
+               [300, 105, 105, 115, 85, 75, 105, 115, 95, 115, 110, 100, 100, 110, 90] + [60] * len(hist_dates))
+    heatmap("Ozon", 15, len(hist_dates), 2 + len(oz_rows))
+    print(f"Ozon: {len(rows)} строк, история {len(hist_dates)} дн")
 
 n_cols = 5 + len(hist_dates)
 header = ["Артикул (база)", f"Заказы ВСЕГО вчера ({Y_L})", f"Заказы ВСЕГО позавчера ({P_L})",
@@ -224,11 +262,115 @@ for i, (k, g) in enumerate(items, 3):
                 + [hval(k, d) for d in hist_dates])
 push_sheet("Общее", header, total, rows, [3], [4], n_cols,
            [320, 130, 145, 90, 80] + [72] * len(hist_dates))
+heatmap("Общее", 5, len(hist_dates), 2 + len(items))
 print(f"Общее: {len(rows)} строк, история: {len(hist_dates)} дней")
 
-# «Общее» — всегда первый лист
-api(f"{BASE}:batchUpdate", {"requests": [{"updateSheetProperties": {
-    "properties": {"sheetId": ensure_sheet("Общее"), "index": 0}, "fields": "index"}}]})
+# ---------- лист «Доли» (доля площадок + конверсия + средняя цена) ----------
+DEF = lambda: {"wo":0,"wopen":0,"oo":0,"ov":0,"wtop":-1,"otop":-1,"wprice":None,"oprice":None}
+sh = {}  # base -> агрегаты
+for r in wb_rows:
+    g = sh.setdefault(base_art(r["art"], MAP), DEF())
+    g["wo"] += r["o_y"]; g["wopen"] += r["v_y"]
+    if r["o_y"] >= g["wtop"]: g["wtop"] = r["o_y"]; g["wprice"] = r.get("cp")
+for r in oz_rows:
+    g = sh.setdefault(base_art(r["art"], MAP), DEF())
+    g["oo"] += r["o_y"]; g["ov"] += r["cl_y"]
+    if r["o_y"] >= g["otop"]: g["otop"] = r["o_y"]; g["oprice"] = r.get("cp")
+sh_items = sorted(sh.items(), key=lambda kv: -(kv[1]["wo"] + kv[1]["oo"]))
+
+def rate(a, b): return round(a / b, 4) if b else ""
+
+sh_header = ["Артикул (база)", "Заказы WB", "Заказы Ozon", "Заказы всего",
+             "Доля WB", "Доля Ozon", "Конверсия WB", "Конверсия Ozon",
+             "Цена WB (клиент)", "Цена Ozon (клиент)"]
+sh_last = 2 + len(sh_items)
+tot = {k: sum(g[k] for _, g in sh_items) for k in ("wo","wopen","oo","ov")}
+sh_total = ["ИТОГО", tot["wo"], tot["oo"], "=B2+C2",
+            "=IF(D2=0;\"\";B2/D2)", "=IF(D2=0;\"\";C2/D2)",
+            rate(tot["wo"], tot["wopen"]), rate(tot["oo"], tot["ov"]), "", ""]
+sh_rows = []
+for i, (k, g) in enumerate(sh_items, 3):
+    sh_rows.append([k, g["wo"], g["oo"], f"=B{i}+C{i}",
+                    f"=IF(D{i}=0;\"\";B{i}/D{i})", f"=IF(D{i}=0;\"\";C{i}/D{i})",
+                    rate(g["wo"], g["wopen"]), rate(g["oo"], g["ov"]),
+                    g["wprice"] if g["wprice"] else "", g["oprice"] if g["oprice"] else ""])
+
+sid = ensure_sheet("Доли")
+api(f"{BASE}/values/{urllib.parse.quote('Доли')}!A1:Z5000:clear", {}, "POST")
+api(f"{BASE}/values/{urllib.parse.quote('Доли')}!A1?valueInputOption=USER_ENTERED",
+    {"values": [sh_header, sh_total] + sh_rows}, "PUT")
+PCT = '0.0%'
+RUB = '#,##0 ₽'
+reqs = [
+    {"updateSheetProperties": {"properties": {"sheetId": sid,
+        "gridProperties": {"frozenRowCount": 2}}, "fields": "gridProperties.frozenRowCount"}},
+    {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "ROWS",
+        "startIndex": 0, "endIndex": 1}, "properties": {"pixelSize": 46}, "fields": "pixelSize"}},
+    {"repeatCell": {"range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1,
+        "startColumnIndex": 0, "endColumnIndex": 10},
+        "cell": {"userEnteredFormat": {"backgroundColor": HDR_BG, "wrapStrategy": "WRAP",
+            "horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE",
+            "textFormat": {"bold": True, "foregroundColor": {"red":1,"green":1,"blue":1}}}},
+        "fields": "userEnteredFormat(backgroundColor,wrapStrategy,horizontalAlignment,verticalAlignment,textFormat)"}},
+    {"repeatCell": {"range": {"sheetId": sid, "startRowIndex": 1, "endRowIndex": 2,
+        "startColumnIndex": 0, "endColumnIndex": 10},
+        "cell": {"userEnteredFormat": {"backgroundColor": TOTAL_BG, "textFormat": {"bold": True}}},
+        "fields": "userEnteredFormat(backgroundColor,textFormat)"}},
+]
+for col, w in enumerate([300,80,80,90,70,70,90,95,90,95]):
+    reqs.append({"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
+        "startIndex": col, "endIndex": col+1}, "properties": {"pixelSize": w}, "fields": "pixelSize"}})
+for col in (4,5,6,7):  # доли и конверсии — проценты
+    reqs.append({"repeatCell": {"range": {"sheetId": sid, "startRowIndex": 1, "endRowIndex": sh_last,
+        "startColumnIndex": col, "endColumnIndex": col+1},
+        "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": PCT}}},
+        "fields": "userEnteredFormat.numberFormat"}})
+for col in (8,9):  # цены — рубли
+    reqs.append({"repeatCell": {"range": {"sheetId": sid, "startRowIndex": 1, "endRowIndex": sh_last,
+        "startColumnIndex": col, "endColumnIndex": col+1},
+        "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": RUB}}},
+        "fields": "userEnteredFormat.numberFormat"}})
+api(f"{BASE}:batchUpdate", {"requests": reqs})
+
+# Попарная подсветка WB vs Ozon: в каждой метрике большее значение зелёным,
+# меньшее красным. Сравнение двух ячеек (без числовых литералов) — локаль не мешает.
+cf_reqs = []
+for _ in range(len(sheets.get("Доли", {}).get("conditionalFormats", []))):
+    cf_reqs.append({"deleteConditionalFormatRule": {"sheetId": sid, "index": 0}})
+def col_l(ci): return col_letter(ci + 1)
+def cf_rule(ci, formula, fill, fg):
+    return {"addConditionalFormatRule": {"rule": {
+        "ranges": [{"sheetId": sid, "startRowIndex": 2, "endRowIndex": sh_last,
+                    "startColumnIndex": ci, "endColumnIndex": ci + 1}],
+        "booleanRule": {"condition": {"type": "CUSTOM_FORMULA", "values": [{"userEnteredValue": formula}]},
+                        "format": {"backgroundColor": fill, "textFormat": {"foregroundColor": fg}}}}, "index": 0}}
+def pair(left, right, guard):
+    L, R = col_l(left), col_l(right)
+    if guard:
+        g = lambda x, y: f"=AND(ISNUMBER(${x}3);ISNUMBER(${y}3);${x}3>${y}3)"
+        l = lambda x, y: f"=AND(ISNUMBER(${x}3);ISNUMBER(${y}3);${x}3<${y}3)"
+    else:
+        g = lambda x, y: f"=${x}3>${y}3"
+        l = lambda x, y: f"=${x}3<${y}3"
+    cf_reqs.append(cf_rule(left, g(L, R), GREEN_BG, GREEN_FG))
+    cf_reqs.append(cf_rule(left, l(L, R), RED_BG, RED_FG))
+    cf_reqs.append(cf_rule(right, g(R, L), GREEN_BG, GREEN_FG))
+    cf_reqs.append(cf_rule(right, l(R, L), RED_BG, RED_FG))
+pair(1, 2, False)   # заказы WB / Ozon
+pair(4, 5, False)   # доли
+pair(6, 7, True)    # конверсии (могут быть пустыми)
+pair(8, 9, True)    # цены
+try:  # подсветка — косметика, не должна прерывать выгрузку
+    api(f"{BASE}:batchUpdate", {"requests": cf_reqs})
+    print(f"Доли: {len(sh_rows)} строк, подсветка WB/Ozon")
+except Exception as e:
+    print(f"Доли: {len(sh_rows)} строк (подсветка пропущена: {str(e)[:80]})")
+
+# Порядок листов: «Общее» первый, «Доли» второй
+api(f"{BASE}:batchUpdate", {"requests": [
+    {"updateSheetProperties": {"properties": {"sheetId": ensure_sheet("Общее"), "index": 0}, "fields": "index"}},
+    {"updateSheetProperties": {"properties": {"sheetId": ensure_sheet("Доли"), "index": 1}, "fields": "index"}},
+]})
 
 # самопроверка 1: ИТОГО
 chk = api(f"{BASE}/values/{urllib.parse.quote('Общее')}!B2:C2?valueRenderOption=UNFORMATTED_VALUE")

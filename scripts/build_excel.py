@@ -52,7 +52,8 @@ if S.get("has_wb"):
         wb_rows.append({"art": c["vendorCode"], "nm": c["nmID"],
             "o_y": y.get("orders", 0), "o_p": pp.get("orders", 0),
             "v_y": y.get("open", 0),   "v_p": pp.get("open", 0),
-            "c_y": y.get("cart", 0),   "c_p": pp.get("cart", 0)})
+            "c_y": y.get("cart", 0),   "c_p": pp.get("cart", 0),
+            "rev_y": y.get("orderSum", 0)})
     wb_rows.sort(key=lambda r: -r["o_y"])
 
 oz_rows = []
@@ -65,7 +66,8 @@ if S.get("has_oz"):
             "o_y": y.get("orders", 0),    "o_p": pp.get("orders", 0),
             "sh_y": y.get("view", 0),     "sh_p": pp.get("view", 0),
             "cl_y": y.get("view_pdp", 0), "cl_p": pp.get("view_pdp", 0),
-            "c_y": y.get("tocart", 0),    "c_p": pp.get("tocart", 0)})
+            "c_y": y.get("tocart", 0),    "c_p": pp.get("tocart", 0),
+            "rev_y": y.get("revenue", 0)})
     oz_rows.sort(key=lambda r: -r["o_y"])
 
 HDR_FILL = PatternFill("solid", start_color="1F4E78")
@@ -108,7 +110,7 @@ first_sheet = True
 if wb_rows:
     ws = book.active if first_sheet else book.create_sheet()
     ws.title = "WB"; first_sheet = False
-    cols = ["Артикул", "nmID", f"Заказы вчера\n({Y_L})", f"Заказы позавчера\n({P_L})", "Δ заказы", "Δ %",
+    cols = ["Артикул", "SKU", f"Заказы вчера\n({Y_L})", f"Заказы позавчера\n({P_L})", "Δ заказы", "Δ %",
             "Переходы в карточку\nвчера", "Переходы\nпозавчера", "Δ переходы",
             "Корзины вчера", "Корзины позавчера", "Δ корзины"]
     sheet_header(ws, cols, [42, 11, 12, 13, 10, 9, 13, 12, 11, 12, 13, 11])
@@ -201,8 +203,52 @@ note = ws.cell(row=last+2, column=1, value=("Источники: " + "; ".join(s
     "Дубли с префиксами (FBS)/блок/бан объединены к базовому артикулу."))
 note.font = Font(name="Arial", size=9, italic=True, color="808080")
 
-# «Общее» — всегда первый лист
-book.move_sheet("Общее", offset=-(len(book.sheetnames) - 1))
+# --- лист «Доли» (доля площадок + конверсия + средняя цена за вчера) ---
+sh = {}
+for r in wb_rows:
+    g = sh.setdefault(norm(r["art"]), {"wo":0,"wopen":0,"wrev":0,"oo":0,"ov":0,"orev":0})
+    g["wo"] += r["o_y"]; g["wopen"] += r["v_y"]; g["wrev"] += r["rev_y"]
+for r in oz_rows:
+    g = sh.setdefault(norm(r["art"]), {"wo":0,"wopen":0,"wrev":0,"oo":0,"ov":0,"orev":0})
+    g["oo"] += r["o_y"]; g["ov"] += r["cl_y"]; g["orev"] += r["rev_y"]
+sh_items = sorted(sh.items(), key=lambda kv: -(kv[1]["wo"] + kv[1]["oo"]))
+
+ws = book.create_sheet("Доли")
+cols = ["Артикул (база)", "Заказы WB", "Заказы Ozon", "Заказы всего", "Доля WB", "Доля Ozon",
+        "Конверсия WB", "Конверсия Ozon", "Ср. цена WB", "Ср. цена Ozon"]
+sheet_header(ws, cols, [44, 11, 11, 11, 9, 9, 11, 12, 11, 12])
+first, last2 = 3, 2 + len(sh_items)
+def pct_cell(c): c.number_format = '0.0%'
+def rub_cell(c): c.number_format = '#,##0 ₽'
+def rate(a_, b_): return a_ / b_ if b_ else None
+def rub(a_, b_): return round(a_ / b_) if b_ else None
+r = 3
+for k, g in sh_items:
+    vals = [k, g["wo"], g["oo"], f"=B{r}+C{r}",
+            f"=IF(D{r}=0,\"\",B{r}/D{r})", f"=IF(D{r}=0,\"\",C{r}/D{r})",
+            rate(g["wo"], g["wopen"]), rate(g["oo"], g["ov"]),
+            rub(g["wrev"], g["wo"]), rub(g["orev"], g["oo"])]
+    for i, v in enumerate(vals, 1):
+        c = ws.cell(row=r, column=i, value=v); c.font = BASE_FONT; c.border = THIN
+    pct_cell(ws.cell(row=r, column=5)); pct_cell(ws.cell(row=r, column=6))
+    pct_cell(ws.cell(row=r, column=7)); pct_cell(ws.cell(row=r, column=8))
+    rub_cell(ws.cell(row=r, column=9)); rub_cell(ws.cell(row=r, column=10))
+    r += 1
+tot = {key: sum(g[key] for _, g in sh_items) for key in ("wo","wopen","wrev","oo","ov","orev")}
+ws.cell(row=2, column=1, value="ИТОГО")
+ws.cell(row=2, column=2, value=tot["wo"]); ws.cell(row=2, column=3, value=tot["oo"])
+ws.cell(row=2, column=4, value="=B2+C2")
+ws.cell(row=2, column=5, value="=IF(D2=0,\"\",B2/D2)"); ws.cell(row=2, column=6, value="=IF(D2=0,\"\",C2/D2)")
+ws.cell(row=2, column=7, value=rate(tot["wo"], tot["wopen"])); ws.cell(row=2, column=8, value=rate(tot["oo"], tot["ov"]))
+ws.cell(row=2, column=9, value=rub(tot["wrev"], tot["wo"])); ws.cell(row=2, column=10, value=rub(tot["orev"], tot["oo"]))
+pct_cell(ws.cell(row=2, column=5)); pct_cell(ws.cell(row=2, column=6))
+pct_cell(ws.cell(row=2, column=7)); pct_cell(ws.cell(row=2, column=8))
+rub_cell(ws.cell(row=2, column=9)); rub_cell(ws.cell(row=2, column=10))
+total_style(ws, 10)
+
+# Порядок: «Общее» первый, «Доли» второй
+book.move_sheet("Общее", offset=-(book.sheetnames.index("Общее")))
+book.move_sheet("Доли", offset=-(book.sheetnames.index("Доли") - 1))
 book.active = 0
 os.makedirs(a.outdir, exist_ok=True)
 out = os.path.join(a.outdir, f"Отчёт_{BRAND}_{Y_L}.xlsx")

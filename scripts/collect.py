@@ -238,10 +238,66 @@ def main():
         save()
         print(f"Ozon orders14: {len(S['oz_orders14'])}")
 
+    # ---------- Клиентские цены (то, что видит покупатель) ----------
+    # WB: публичный card.wb.ru → product (цена на витрине). Ozon: MPStats
+    # ozon_card_price (цена с Ozon Картой) — клиентскую Seller API не отдаёт.
+    if has_wb and S.get("wb_client_price") is None:
+        prices = {}
+        nm_all = [c["nmID"] for c in S["wb_cards"]]
+        for i in range(0, len(nm_all), 50):
+            chunk = ";".join(str(n) for n in nm_all[i:i+50])
+            try:
+                d = http(f"https://card.wb.ru/cards/v4/detail?appType=1&curr=rub&dest=-1257786&nm={chunk}")
+            except Exception:
+                continue
+            for p in d.get("products", []):
+                pr = (p.get("sizes", [{}]) or [{}])[0].get("price", {}) or {}
+                if pr.get("product"):
+                    prices[str(p["id"])] = round(pr["product"] / 100)
+            time.sleep(0.3)
+        S["wb_client_price"] = prices; save()
+        print(f"WB client prices: {len(prices)}")
+
+    mp_token = K.get("MPSTATS_TOKEN", "")
+    if has_oz and mp_token and S.get("oz_client_price") is None:
+        prices = dict(S.get("oz_cp_partial", {}))
+        # только активные sku (с остатком или заказами за 14 дней) — меньше запросов
+        ozst = S.get("oz_stocks") or {}; ozo14 = S.get("oz_orders14") or {}
+        def _act(sk):
+            off = (S["ozon"].get(sk) or {}).get("offer_id", "")
+            return ozst.get(off, 0) > 0 or ozo14.get(str(sk), 0) > 0
+        skus = [s for s in (S.get("ozon") or {}) if str(s) not in prices and _act(s)]
+        MP_H = {"X-Mpstats-TOKEN": mp_token, "Content-Type": "application/json"}
+        done_n = 0
+        for sku in skus:
+            if budget_left() < 4:
+                S["oz_cp_partial"] = prices; save()
+                print("PROGRESS oz prices — перезапусти"); return
+            prices[str(sku)] = None  # помечаем обработанным сразу (чтобы не зациклиться)
+            try:
+                d = http(f"https://mpstats.io/api/oz/get/item/{sku}/sales", MP_H, timeout=8, _tries=1)
+                rows = d if isinstance(d, list) else []
+                # MPStats отдаёт дни не по порядку. Целимся во ВЧЕРА (d_yest);
+                # если у MPStats его ещё нет (лаг) — берём самый свежий доступный.
+                rows = sorted((r for r in rows if r.get("ozon_card_price") or r.get("final_price")),
+                              key=lambda r: r.get("data", ""))
+                if rows:
+                    pick = next((r for r in rows if (r.get("data") or "")[:10] == d_yest), rows[-1])
+                    cp = pick.get("ozon_card_price") or pick.get("final_price")
+                    if cp: prices[str(sku)] = round(cp)
+            except Exception:
+                pass
+            S["oz_cp_partial"] = prices; save()  # после каждого sku — против зависаний
+        S["oz_client_price"] = {k: v for k, v in prices.items() if v}
+        S.pop("oz_cp_partial", None); save()
+        print(f"Ozon client prices: {len([v for v in prices.values() if v])}")
+
     wb_ok = (not has_wb) or (S["wb_cards"] is not None and
-             S["wb_funnel_done"] >= (len(S["wb_cards"]) + 19)//20 and S["wb_orders14"] is not None)
+             S["wb_funnel_done"] >= (len(S["wb_cards"]) + 19)//20 and S["wb_orders14"] is not None
+             and S.get("wb_client_price") is not None)
     oz_ok = (not has_oz) or (S["ozon"] is not None and S["oz_stocks"] is not None
-                             and S["oz_orders14"] is not None)
+                             and S["oz_orders14"] is not None
+                             and (not mp_token or S.get("oz_client_price") is not None))
     print("DONE" if wb_ok and oz_ok else "PROGRESS — перезапусти")
 
 if __name__ == "__main__":

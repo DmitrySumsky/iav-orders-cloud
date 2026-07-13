@@ -27,15 +27,18 @@ jobs:
       - name: Секреты -> файлы
         env:
           API_KEYS: ${{ secrets.API_KEYS_FILE }}
+          API_KEYS_EXTRA: ${{ secrets.API_KEYS_EXTRA }}
           SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
         run: |
           printf '%s' "$API_KEYS" > api_keys.txt
+          printf '\n%s\n' "$API_KEYS_EXTRA" >> api_keys.txt
           printf '%s' "$SA_JSON" > google_sa.json
-          python3 -c "import json; json.load(open('google_sa.json')); print('SA JSON валиден')"
+          python3 -c "import json; print('SA JSON валиден, client_email:', json.load(open('google_sa.json'))['client_email'])"
 
       - name: Конвейер по всем брендам
         env:
           TIME_BUDGET: "86400"
+          BRANDS: "NATURI,VEXOR,ORZAX,LOVE&DOVE,SUNSHINE,HEALTH FORM,4ME"
         run: python3 -u scripts/run_all.py
 
       - name: Сохранить историю (коммит state/)

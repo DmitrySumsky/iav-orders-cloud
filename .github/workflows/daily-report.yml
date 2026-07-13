@@ -38,7 +38,7 @@ jobs:
       - name: Конвейер по всем брендам
         env:
           TIME_BUDGET: "86400"
-          BRANDS: "VEXOR,ORZAX,LOVE&DOVE,SUNSHINE,HEALTH FORM,4ME,NATURI"
+          BRANDS: "HEALTH FORM,4ME,NATURI"
         run: python3 -u scripts/run_all.py
 
       - name: Сохранить историю (коммит state/)

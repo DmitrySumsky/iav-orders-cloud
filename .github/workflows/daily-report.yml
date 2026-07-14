@@ -38,6 +38,7 @@ jobs:
       - name: Конвейер по всем брендам
         env:
           TIME_BUDGET: "86400"
+          HISTORY_DAYS: "8"
           BRANDS: "VEXOR,ORZAX,LOVE&DOVE,SUNSHINE,HEALTH FORM,4ME,NATURI"
         run: python3 -u scripts/run_all.py
 

@@ -1,7 +1,9 @@
 name: Ежедневный отчёт по заказам WB+Ozon
 
 on:
-  workflow_dispatch:        # кнопка ручного запуска
+  workflow_dispatch:
+  schedule:
+    - cron: "0 0 * * *"   # 03:00 МСК: ночной сбор данных (без отправки в TG, см. SKIP_TG)        # кнопка ручного запуска
 
 permissions:
   contents: write           # чтобы коммитить накопленную историю обратно
@@ -38,6 +40,7 @@ jobs:
       - name: Конвейер по всем брендам
         env:
           TIME_BUDGET: "86400"
+          SKIP_TG: ${{ github.event_name == 'schedule' && '1' || '' }}
           HISTORY_DAYS: "8"
           BRANDS: "VEXOR,ORZAX,LOVE&DOVE,SUNSHINE,HEALTH FORM,4ME,NATURI"
         run: python3 -u scripts/run_all.py

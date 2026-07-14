@@ -79,7 +79,9 @@ for idx, brand in enumerate(brand_list):
             print(f"ОШИБКА gsheet {brand}"); failed.append(brand)
 
     sent_flag = os.path.join(STATE, "sent_" + os.path.basename(state_f))
-    if os.path.exists(sent_flag):
+    if os.environ.get("SKIP_TG"):
+        print("SKIP_TG — отправка отложена до утреннего прогона")
+    elif os.path.exists(sent_flag):
         print("TG уже отправлен за эту дату — пропуск")
     elif K.get("TELEGRAM_BOT_TOKEN") and (K.get("TELEGRAM_CHAT_ID") or K.get(f"{prefix}_TG_CHATS")):
         args = ["python3", f"{HERE}/send_telegram.py", "--state", state_f, "--keys", KEYS,

@@ -78,12 +78,17 @@ for idx, brand in enumerate(brand_list):
         if "VERIFY OK" not in r.stdout:
             print(f"ОШИБКА gsheet {brand}"); failed.append(brand)
 
-    if K.get("TELEGRAM_BOT_TOKEN") and (K.get("TELEGRAM_CHAT_ID") or K.get(f"{prefix}_TG_CHATS")):
+    sent_flag = os.path.join(STATE, "sent_" + os.path.basename(state_f))
+    if os.path.exists(sent_flag):
+        print("TG уже отправлен за эту дату — пропуск")
+    elif K.get("TELEGRAM_BOT_TOKEN") and (K.get("TELEGRAM_CHAT_ID") or K.get(f"{prefix}_TG_CHATS")):
         args = ["python3", f"{HERE}/send_telegram.py", "--state", state_f, "--keys", KEYS,
                 "--file", xlsx]
         if sheet_url: args += ["--sheet-url", sheet_url]
         r = subprocess.run(args, capture_output=True, text=True)
         print(r.stdout.strip() or r.stderr[-500:])
+        if "OK" in r.stdout:
+            open(sent_flag, "w").write("sent")
 
 print("\nИТОГ:", "все бренды OK" if not failed else f"ошибки: {failed}")
 sys.exit(1 if failed else 0)

@@ -15,7 +15,7 @@ concurrency:
 jobs:
   report:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
 
@@ -42,7 +42,7 @@ jobs:
           TIME_BUDGET: "86400"
           SKIP_TG: ${{ github.event_name == 'schedule' && '1' || '' }}
           HISTORY_DAYS: "8"
-          BRANDS: "VEXOR,ORZAX,LOVE&DOVE,SUNSHINE,HEALTH FORM,4ME,NATURI"
+          BRANDS: "NATURI,4ME,HEALTH FORM,SUNSHINE,VEXOR,ORZAX,LOVE&DOVE"
         run: python3 -u scripts/run_all.py
 
       - name: Сохранить историю (коммит state/)

@@ -113,7 +113,7 @@ if wb_token and S.get("has_wb"):
     recent_missing = sorted(d for d in want_dates
                             if d not in H["wb_dates"] and d >= recent_floor)
     if recent_missing:
-        batches = [nm_all[i:i+20] for i in range(0, len(nm_all), 20)]
+        batches = [nm_all[i:i+50] for i in range(0, len(nm_all), 50)]
         w_start, w_end = recent_missing[0], recent_missing[-1]
         for bi, nm in enumerate(batches):
             key = f"win|{w_start}|{w_end}|{bi}"

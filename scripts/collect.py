@@ -101,7 +101,7 @@ def main():
 
     if has_wb:
         nm_all = [c["nmID"] for c in S["wb_cards"]]
-        batches = [nm_all[i:i+50] for i in range(0, len(nm_all), 50)]
+        batches = [nm_all[i:i+20] for i in range(0, len(nm_all), 20)]
         # воронка за 2 дня (история): батчи по 20, 3 req/min
         while S["wb_funnel_done"] < len(batches):
             if budget_left() < 5:

@@ -7,6 +7,10 @@ on:
         description: "Бренды через запятую (пусто = все)"
         required: false
         default: ""
+      skip_tg:
+        description: "1 = только собрать данные, без отправки в TG"
+        required: false
+        default: ""
   schedule:
     - cron: "0 0 * * *"   # 03:00 МСК: ночной сбор данных (без отправки в TG, см. SKIP_TG)        # кнопка ручного запуска
 
@@ -45,7 +49,7 @@ jobs:
       - name: Конвейер по всем брендам
         env:
           TIME_BUDGET: "86400"
-          SKIP_TG: ${{ github.event_name == 'schedule' && '1' || '' }}
+          SKIP_TG: ${{ github.event_name == 'schedule' && '1' || github.event.inputs.skip_tg }}
           HISTORY_DAYS: "8"
           BRANDS: ${{ github.event.inputs.brands || 'NATURI,4ME,HEALTH FORM,SUNSHINE,VEXOR,ORZAX,LOVE&DOVE' }}
         run: python3 -u scripts/run_all.py

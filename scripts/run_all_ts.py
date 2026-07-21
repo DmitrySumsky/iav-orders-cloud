@@ -198,7 +198,8 @@ if K.get("SVOD_GSHEET_ID"):
     st = STATUS.setdefault("Свод «Общая»", {"Сбор данных": "—", "Google-таблица": "—",
                                             "Telegram": "—", "Детали": ""})
     if sa_valid():
-        r = subprocess.run(["python3", f"{HERE}/svod_report.py", "--keys", KEYS, "--sa", SA],
+        r = subprocess.run(["python3", f"{HERE}/svod_report.py", "--keys", KEYS, "--sa", SA,
+                            "--state-dir", STATE],
                            capture_output=True, text=True)
         print((r.stdout + r.stderr).strip()[-1500:])
         if "DONE" not in r.stdout:
@@ -206,12 +207,27 @@ if K.get("SVOD_GSHEET_ID"):
             st["Сбор данных"] = st["Google-таблица"] = "❌"
         else:
             st["Сбор данных"] = st["Google-таблица"] = "✅"
-            totals = [l for l in r.stdout.splitlines() if l.startswith("Итого за")]
-            if totals and K.get("SVOD_TG_CHATS") and not os.environ.get("SKIP_TG"):
-                url = f"https://docs.google.com/spreadsheets/d/{K['SVOD_GSHEET_ID']}/edit"
-                sent = tg_send(K["SVOD_TG_CHATS"], "📊 Свод «Общая». " + totals[0].split(" | ")[0]
-                               + "\n" + url)
-                st["Telegram"] = "✅" if sent else "❌"
+            # оповещение картинкой (итоги + разбивка по брендам), как у брендовых отчётов
+            summary_f = os.path.join(STATE, "svod_summary.json")
+            day = ""
+            try:
+                day = json.load(open(summary_f, encoding="utf-8")).get("date", "")
+            except Exception:
+                pass
+            sent_flag = os.path.join(STATE, f"sent_SVOD_{day}.json")
+            if os.environ.get("SKIP_TG"):
+                print("SKIP_TG — сводка отложена"); st["Telegram"] = "⏸ отложена"
+            elif day and os.path.exists(sent_flag):
+                print("сводка уже отправлена за эту дату — пропуск"); st["Telegram"] = "✅ (ранее)"
+            elif day and K.get("SVOD_TG_CHATS"):
+                r2 = subprocess.run(["python3", f"{HERE}/svod_telegram.py", "--summary", summary_f,
+                                     "--keys", KEYS], capture_output=True, text=True)
+                print((r2.stdout + r2.stderr).strip()[-800:])
+                if r2.returncode == 0 and "OK" in r2.stdout:
+                    st["Telegram"] = "✅"
+                    open(sent_flag, "w").write("sent")
+                else:
+                    st["Telegram"] = "❌"; failed["СВОД"] = "svod_telegram"
     else:
         print("SA недоступен — свод пропущен"); st["Google-таблица"] = "нет SA"
 

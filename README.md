@@ -14,7 +14,9 @@ workflow_dispatch) на облачных раннерах GitHub; подстра
   секунды), воронка WB каскадом: async CSV-отчёт → батчи → без воронки;
   история — `history_ts.py`.
 - Остальные (ORZAX, LOVE&DOVE) — старый путь `collect.py`/`history.py`.
-- После брендов: свод «Общая» (`svod_report.py`) и цены WB+Ozon из MPStats
+- После брендов: свод «Общая» (`svod_report.py`: история заказов по дням
+  в листах + `state/svod_history.json`, утренняя сводка в TG картинкой
+  с разбивкой по брендам — `svod_telegram.py`) и цены WB+Ozon из MPStats
   (`prices_update.py`).
 - Изоляция брендов, финальный ретрай, анти-дубль (`state/sent_*`), алерт
   о сбоях в служебный TG.

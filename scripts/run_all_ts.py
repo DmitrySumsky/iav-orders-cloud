@@ -105,7 +105,9 @@ def process(brand):
                             "--history", os.path.join(STATE, f"history_{prefix}.json"),
                             "--sa", SA, "--sheet-id", sheet_id], capture_output=True, text=True)
         print(r.stdout.strip() or r.stderr[-500:])
-        if "VERIFY OK" not in r.stdout: return "gsheet"
+        if "VERIFY OK" not in r.stdout:
+            # не валим бренд: TG с Excel важнее; таблица могла быть не расшарена на SA
+            warnings.append(f"{brand}: Google Sheet не обновлён")
     elif sheet_id:
         print("SA недоступен — Google Sheet пропущен")
 
@@ -125,7 +127,7 @@ def process(brand):
     return None
 
 brand_list = [b.strip() for b in BRANDS if b.strip()]
-failed = {}
+failed, warnings = {}, []
 for idx, brand in enumerate(brand_list):
     if idx > 0: time.sleep(10)
     print(f"\n=== {brand} ===", flush=True)
@@ -160,9 +162,23 @@ if K.get("SVOD_GSHEET_ID"):
     else:
         print("SA недоступен — свод пропущен")
 
+# отчёт по ценам WB+Ozon (MPStats) — независим от брендовых отчётов
+if K.get("PRICES_GSHEET_ID"):
+    print("\n=== Отчёт по ценам (MPStats) ===", flush=True)
+    if sa_valid():
+        r = subprocess.run(["python3", f"{HERE}/prices_update.py", "--keys", KEYS,
+                            "--sa", SA, "--sheet-id", K["PRICES_GSHEET_ID"]],
+                           capture_output=True, text=True)
+        print((r.stdout + r.stderr).strip()[-1500:])
+        if "DONE" not in r.stdout: failed["ЦЕНЫ"] = "prices_update"
+    else:
+        print("SA недоступен — цены пропущены")
+
 print("\nИТОГ:", "все бренды OK" if not failed else f"ошибки: {failed}")
-if failed:
-    tg_alert("⚠️ Отчёт по заказам: сбой по брендам "
-             + ", ".join(f"{b} ({e})" for b, e in failed.items())
-             + ". Детали в GitHub Actions.")
+if warnings: print("предупреждения:", "; ".join(warnings))
+if failed or warnings:
+    parts = []
+    if failed: parts.append("сбой: " + ", ".join(f"{b} ({e})" for b, e in failed.items()))
+    if warnings: parts.append("предупреждения: " + "; ".join(warnings))
+    tg_alert("⚠️ Отчёт по заказам: " + " | ".join(parts) + ". Детали в GitHub Actions.")
 sys.exit(1 if failed else 0)

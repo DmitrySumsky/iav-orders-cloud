@@ -176,7 +176,7 @@ if K.get("PRICES_GSHEET_ID"):
 
 print("\nИТОГ:", "все бренды OK" if not failed else f"ошибки: {failed}")
 if warnings: print("предупреждения:", "; ".join(warnings))
-if failed or warnings:
+if (failed or warnings) and not os.environ.get("SKIP_TG"):
     parts = []
     if failed: parts.append("сбой: " + ", ".join(f"{b} ({e})" for b, e in failed.items()))
     if warnings: parts.append("предупреждения: " + "; ".join(warnings))

@@ -38,17 +38,48 @@ def sa_valid():
     except Exception:
         return False
 
+# Пункт управления: настройки из таблицы перекрывают api_keys; подскрипты
+# получают объединённый файл ключей. Время крона синхронизируется само.
+sys.path.insert(0, HERE)
+from control_panel import load_settings, sync_cron, write_dashboard
+if sa_valid():
+    overrides = load_settings(SA, K)
+    if overrides:
+        K.update(overrides)
+        merged = os.path.join(ROOT, "api_keys_merged.txt")
+        with open(merged, "w", encoding="utf-8") as f:
+            f.write(open(KEYS, encoding="utf-8").read())
+            f.write("\n# --- оверрайды из пункта управления ---\n")
+            for k, v in overrides.items(): f.write(f"{k}={v}\n")
+        KEYS = merged
+    sync_cron(K)
+    if K.get("BRANDS") and "BRANDS" not in os.environ:
+        BRANDS = K["BRANDS"].split(",")
+    if K.get("HISTORY_DAYS"): HISTORY_DAYS = K["HISTORY_DAYS"]
+
+def tg_send(chats, text):
+    """Отправка текста в чаты вида 'chat_id[:topic],...' ботом системы."""
+    bot = K.get("TELEGRAM_BOT_TOKEN")
+    if not bot or not chats: return False
+    ok = True
+    for pair in str(chats).split(","):
+        pair = pair.strip()
+        if not pair: continue
+        cid, _, topic = pair.partition(":")
+        params = {"chat_id": cid, "text": text}
+        if topic: params["message_thread_id"] = topic
+        try:
+            body = urllib.parse.urlencode(params).encode()
+            urllib.request.urlopen(
+                urllib.request.Request(f"https://api.telegram.org/bot{bot}/sendMessage", data=body),
+                timeout=30).read()
+        except Exception as e:
+            print(f"TG {cid}: не отправлено ({e})"); ok = False
+    return ok
+
 def tg_alert(text):
     """Служебное уведомление о сбое (не валит прогон, если само упало)."""
-    bot, chat = K.get("TELEGRAM_BOT_TOKEN"), K.get("TELEGRAM_CHAT_ID")
-    if not bot or not chat: return
-    try:
-        body = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
-        urllib.request.urlopen(
-            urllib.request.Request(f"https://api.telegram.org/bot{bot}/sendMessage", data=body),
-            timeout=30).read()
-    except Exception as e:
-        print(f"алерт не отправлен: {e}")
+    tg_send(K.get("TELEGRAM_CHAT_ID", ""), text)
 
 def run_until_done(args, max_runs=25):
     """Резюмируемые скрипты печатают DONE. Между повторами пауза."""
@@ -64,29 +95,32 @@ def run_until_done(args, max_runs=25):
 def process(brand):
     """Полный конвейер одного бренда. Возвращает None или текст ошибки."""
     prefix = re.sub(r"[^A-Z0-9]", "", brand.upper())
+    st = STATUS.setdefault(brand, {"Сбор данных": "—", "Google-таблица": "—",
+                                   "Telegram": "—", "Детали": ""})
     use_ts = bool(K.get(f"{prefix}_TS_TOKEN"))
     has_keys = use_ts or K.get(f"{prefix}_WB_TOKEN") or \
                (K.get(f"{prefix}_OZON_CLIENT_ID") and K.get(f"{prefix}_OZON_API_KEY"))
     if not has_keys:
-        print("нет ключей — пропуск"); return None
+        print("нет ключей — пропуск"); st["Детали"] = "нет ключей"; return None
 
     keys_arg = KEYS
     if use_ts:
         if not run_until_done(["python3", f"{HERE}/collect_ts.py", "--brand", brand,
                                "--keys", keys_arg, "--state-dir", STATE], max_runs=4):
-            return "collect_ts"
+            st["Сбор данных"] = "❌"; return "collect_ts"
         if not run_until_done(["python3", f"{HERE}/history_ts.py", "--brand", brand,
                                "--keys", keys_arg, "--state-dir", STATE,
                                "--days", HISTORY_DAYS], max_runs=4):
-            return "history_ts"
+            st["Сбор данных"] = "❌"; return "history_ts"
     else:
         if not run_until_done(["python3", f"{HERE}/collect.py", "--brand", brand,
                                "--keys", keys_arg, "--state-dir", STATE]):
-            return "collect"
+            st["Сбор данных"] = "❌"; return "collect"
         if not run_until_done(["python3", f"{HERE}/history.py", "--brand", brand,
                                "--keys", keys_arg, "--state-dir", STATE,
                                "--days", HISTORY_DAYS]):
-            return "history"
+            st["Сбор данных"] = "❌"; return "history"
+    st["Сбор данных"] = "✅"
 
     states = sorted(f for f in os.listdir(STATE) if f.startswith(prefix + "_2"))
     if not states: return "нет state"
@@ -95,7 +129,8 @@ def process(brand):
     r = subprocess.run(["python3", f"{HERE}/build_excel.py", "--state", state_f,
                         "--outdir", REPORTS], capture_output=True, text=True)
     print(r.stdout.strip() or r.stderr[-500:])
-    if "VERIFY OK" not in r.stdout: return "excel"
+    if "VERIFY OK" not in r.stdout:
+        st["Детали"] = "Excel не собрался"; return "excel"
     xlsx = [l.split("saved ", 1)[1] for l in r.stdout.splitlines() if l.startswith("saved ")][0]
 
     sheet_id = K.get(f"{prefix}_GSHEET_ID", "")
@@ -108,26 +143,32 @@ def process(brand):
         if "VERIFY OK" not in r.stdout:
             # не валим бренд: TG с Excel важнее; таблица могла быть не расшарена на SA
             warnings.append(f"{brand}: Google Sheet не обновлён")
+            st["Google-таблица"] = "❌ не обновлена"
+        else:
+            st["Google-таблица"] = "✅"
     elif sheet_id:
-        print("SA недоступен — Google Sheet пропущен")
+        print("SA недоступен — Google Sheet пропущен"); st["Google-таблица"] = "нет SA"
 
     sent_flag = os.path.join(STATE, "sent_" + os.path.basename(state_f))
     if os.environ.get("SKIP_TG"):
-        print("SKIP_TG — отправка отложена")
+        print("SKIP_TG — отправка отложена"); st["Telegram"] = "⏸ отложена"
     elif os.path.exists(sent_flag):
-        print("TG уже отправлен за эту дату — пропуск")
+        print("TG уже отправлен за эту дату — пропуск"); st["Telegram"] = "✅ (ранее)"
     elif K.get("TELEGRAM_BOT_TOKEN") and (K.get("TELEGRAM_CHAT_ID") or K.get(f"{prefix}_TG_CHATS")):
         args = ["python3", f"{HERE}/send_telegram.py", "--state", state_f, "--keys", KEYS,
                 "--file", xlsx]
         if sheet_url: args += ["--sheet-url", sheet_url]
         r = subprocess.run(args, capture_output=True, text=True)
         print(r.stdout.strip() or r.stderr[-500:])
-        if "OK" not in r.stdout: return "telegram"
+        if "OK" not in r.stdout:
+            st["Telegram"] = "❌"; return "telegram"
+        st["Telegram"] = "✅"
         open(sent_flag, "w").write("sent")
     return None
 
 brand_list = [b.strip() for b in BRANDS if b.strip()]
-failed, warnings = {}, []
+failed, warnings, STATUS = {}, [], {}
+T_RUN = time.time()
 for idx, brand in enumerate(brand_list):
     if idx > 0: time.sleep(10)
     print(f"\n=== {brand} ===", flush=True)
@@ -154,25 +195,55 @@ if failed:
 # сводный отчёт «Общая» (позиции × бренды) — после всех брендов
 if K.get("SVOD_GSHEET_ID"):
     print("\n=== Сводный отчёт «Общая» ===", flush=True)
+    st = STATUS.setdefault("Свод «Общая»", {"Сбор данных": "—", "Google-таблица": "—",
+                                            "Telegram": "—", "Детали": ""})
     if sa_valid():
         r = subprocess.run(["python3", f"{HERE}/svod_report.py", "--keys", KEYS, "--sa", SA],
                            capture_output=True, text=True)
         print((r.stdout + r.stderr).strip()[-1500:])
-        if "DONE" not in r.stdout: failed["СВОД"] = "svod_report"
+        if "DONE" not in r.stdout:
+            failed["СВОД"] = "svod_report"
+            st["Сбор данных"] = st["Google-таблица"] = "❌"
+        else:
+            st["Сбор данных"] = st["Google-таблица"] = "✅"
+            totals = [l for l in r.stdout.splitlines() if l.startswith("Итого за")]
+            if totals and K.get("SVOD_TG_CHATS") and not os.environ.get("SKIP_TG"):
+                url = f"https://docs.google.com/spreadsheets/d/{K['SVOD_GSHEET_ID']}/edit"
+                sent = tg_send(K["SVOD_TG_CHATS"], "📊 Свод «Общая». " + totals[0].split(" | ")[0]
+                               + "\n" + url)
+                st["Telegram"] = "✅" if sent else "❌"
     else:
-        print("SA недоступен — свод пропущен")
+        print("SA недоступен — свод пропущен"); st["Google-таблица"] = "нет SA"
 
 # отчёт по ценам WB+Ozon (MPStats) — независим от брендовых отчётов
 if K.get("PRICES_GSHEET_ID"):
     print("\n=== Отчёт по ценам (MPStats) ===", flush=True)
+    st = STATUS.setdefault("Цены WB+Ozon", {"Сбор данных": "—", "Google-таблица": "—",
+                                            "Telegram": "—", "Детали": ""})
     if sa_valid():
         r = subprocess.run(["python3", f"{HERE}/prices_update.py", "--keys", KEYS,
                             "--sa", SA, "--sheet-id", K["PRICES_GSHEET_ID"]],
                            capture_output=True, text=True)
         print((r.stdout + r.stderr).strip()[-1500:])
-        if "DONE" not in r.stdout: failed["ЦЕНЫ"] = "prices_update"
+        if "DONE" not in r.stdout:
+            failed["ЦЕНЫ"] = "prices_update"
+            st["Сбор данных"] = st["Google-таблица"] = "❌"
+        else:
+            st["Сбор данных"] = st["Google-таблица"] = "✅"
+            filled = [l.strip() for l in r.stdout.splitlines() if "залито ячеек" in l]
+            st["Детали"] = "; ".join(filled)[:200]
     else:
-        print("SA недоступен — цены пропущены")
+        print("SA недоступен — цены пропущены"); st["Google-таблица"] = "нет SA"
+
+# дашборд пункта управления — статус каждого шага последнего прогона
+if sa_valid() and K.get("CONTROL_GSHEET_ID"):
+    mins = int((time.time() - T_RUN) // 60)
+    info = ("без ошибок" if not failed else f"ошибки: {', '.join(failed)}") + f", {mins} мин"
+    dash_rows = [[name, s.get("Сбор данных", "—"), s.get("Google-таблица", "—"),
+                  s.get("Telegram", "—"),
+                  (s.get("Детали", "") + (" | " + failed.get(name, "") if name in failed else "")).strip(" |")]
+                 for name, s in STATUS.items()]
+    write_dashboard(SA, K, info, dash_rows)
 
 print("\nИТОГ:", "все бренды OK" if not failed else f"ошибки: {failed}")
 if warnings: print("предупреждения:", "; ".join(warnings))

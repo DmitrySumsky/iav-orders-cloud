@@ -13,11 +13,18 @@ GAS-скрипт в самой таблице остаётся как ручно
 Рядом пишется svod_summary.json — итоги по брендам вчера/позавчера для
 Telegram-картинки (svod_telegram.py).
 
+Полная история в таблице — листы «История Общее» / «История ВБ» / «История
+Озон»: строка = позиция × бренд, колонки = все сохранённые дни (до 60),
+сверху блок «Итого» по каждому бренду за каждый день. Тепловая подсветка
+считается в скрипте и пишется цветом ячеек (без условных форматов — их
+лимиты бережём для основных листов).
+
 Ключи (api_keys, можно несколько файлов через запятую):
   SVOD_GSHEET_ID     — id боевой таблицы
   SVOD_BRANDS        — колонки отчёта по порядку: "Naturi=NATURI,Health Form=HEALTHFORM,..."
                        (слева отображаемое имя, справа префикс *_TS_* ключей)
-  SVOD_HISTORY_DAYS  — глубина истории в листах (дефолт 14)
+  SVOD_HISTORY_DAYS  — колонки прошлых дней в ОСНОВНЫХ листах (дефолт 14)
+  SVOD_BACKFILL_DAYS — глубина добора истории из TrueStats (дефолт 30)
   TRUESTATS_TOKEN_*, <PREFIX>_TS_WB_ACCOUNTS/_TS_OZON_ACCOUNTS — как у collect_ts
 
 Использование:
@@ -25,7 +32,7 @@ Telegram-картинки (svod_telegram.py).
       [--state-dir state] [--date YYYY-MM-DD] [--dry-run]
 Печатает DONE при успехе (ошибки кабинетов не валят отчёт — помечаются в шапке).
 """
-import argparse, json, re, sys, os, time, urllib.request, urllib.parse
+import argparse, json, re, sys, os, time, urllib.request, urllib.parse, urllib.error
 from datetime import timedelta, datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -73,6 +80,7 @@ def rep_norm(offer, tokens):
 # ---------- данные из TrueStats + история по дням ----------
 PREV = (datetime.fromisoformat(DAY).date() - timedelta(days=1)).isoformat()
 HIST_DAYS = max(2, int(K.get("SVOD_HISTORY_DAYS", "14") or 14))
+BACKFILL = max(HIST_DAYS, int(K.get("SVOD_BACKFILL_DAYS", "30") or 30))
 hist_f = os.path.join(a.state_dir, "svod_history.json")
 try:
     HIST = json.load(open(hist_f, encoding="utf-8"))
@@ -80,7 +88,7 @@ except Exception:
     HIST = {}
 HIST.setdefault("wb", {}); HIST.setdefault("oz", {})
 want_days = [(datetime.fromisoformat(DAY).date() - timedelta(days=i)).isoformat()
-             for i in range(HIST_DAYS)]
+             for i in range(BACKFILL)]
 
 errors = []
 for disp, prefix in BRANDS:
@@ -146,7 +154,11 @@ BASE = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}"
 def api(url, payload=None, method=None):
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data, headers=H, method=method)
-    return json.loads(urllib.request.urlopen(req, timeout=60).read())
+    try:
+        return json.loads(urllib.request.urlopen(req, timeout=60).read())
+    except urllib.error.HTTPError as e:
+        print(f"Sheets API {e.code}: {e.read().decode()[:400]}")
+        raise
 
 def col_a1(n):
     s = ""
@@ -301,6 +313,10 @@ for idx, ((name, ttl, color), agg) in enumerate(zip(SHEETS, (agg_all, agg_wb, ag
     reqs += [
         {"unmergeCells": {"range": {"sheetId": sid}}},
         {"updateCells": {"range": {"sheetId": sid}, "fields": "userEnteredValue,userEnteredFormat,note"}},
+        # у листа по умолчанию 26 колонок — расширяем сетку под колонки истории
+        {"updateSheetProperties": {"properties": {"sheetId": sid,
+            "gridProperties": {"columnCount": max(n_cols + 2, 26)}},
+            "fields": "gridProperties.columnCount"}},
         {"updateSheetProperties": {"properties": {"sheetId": sid, "index": idx,
             "gridProperties": {"frozenRowCount": 3}}, "fields": "index,gridProperties.frozenRowCount"}},
         {"mergeCells": {"range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1,
@@ -366,9 +382,119 @@ for idx, ((name, ttl, color), agg) in enumerate(zip(SHEETS, (agg_all, agg_wb, ag
             for v in rw]} for rw in rows],
         "fields": "userEnteredValue"}})
 
+# ---------- листы «История …»: позиция × бренд, все сохранённые дни ----------
+# Тепловая подсветка считается здесь и пишется цветом ячеек (по строке, свой
+# min/max) — без условных форматов, чтобы их число в таблице не разрасталось.
+all_days = sorted({d for hk in ("wb", "oz") for d in HIST[hk]}, reverse=True)
+CENTER = {"horizontalAlignment": "CENTER"}
+
+def heat(v, mn, mx):
+    if not isinstance(v, (int, float)) or mx <= mn:
+        return CENTER
+    t = (v - mn) / (mx - mn)
+    return {"horizontalAlignment": "CENTER",
+            "backgroundColor": {"red": 1 - 0.612 * t, "green": 1 - 0.255 * t, "blue": 1 - 0.518 * t}}
+
+def cell(v, fmt=None):
+    c = {"userEnteredValue": ({"numberValue": v} if isinstance(v, (int, float)) and v != ""
+                              else {"stringValue": str(v)})}
+    if fmt: c["userEnteredFormat"] = fmt
+    return c
+
+hist_verify = None
+HSHEETS = [("История Общее", "ОБЩЕЕ", ("wb", "oz"), "#38761D"),
+           ("История ВБ", "WB", ("wb",), "#C90076"),
+           ("История Озон", "OZON", ("oz",), "#0B5394")]
+for hidx, (name, ttl, hkeys, color) in enumerate(HSHEETS):
+    ser = {}                                     # (позиция, бренд) -> {день: шт}
+    for hk in hkeys:
+        for day, per in HIST[hk].items():
+            for disp in disp_names:
+                for art, n in per.get(disp, {}).items():
+                    pos = by_offer.get(disp + "||" + art)
+                    if not pos: continue
+                    s = ser.setdefault((pos, disp), {})
+                    s[day] = s.get(day, 0) + n
+    btot = {}                                    # бренд -> {день: шт}
+    for (pos, disp), s in ser.items():
+        bt = btot.setdefault(disp, {})
+        for day, n in s.items(): bt[day] = bt.get(day, 0) + n
+    alld = {}
+    for bt in btot.values():
+        for day, n in bt.items(): alld[day] = alld.get(day, 0) + n
+    if ttl == "ОБЩЕЕ": hist_verify = alld.get(DAY, 0)
+
+    n_cols = 2 + len(all_days)
+    WHITE = {"red": 1, "green": 1, "blue": 1}
+    title_fmt = {"backgroundColor": hexrgb(color), "horizontalAlignment": "CENTER",
+                 "textFormat": {"bold": True, "fontSize": 12, "foregroundColor": WHITE}}
+    head_fmt = {"backgroundColor": hexrgb("#D9D9D9"), "horizontalAlignment": "CENTER",
+                "textFormat": {"bold": True}, "wrapStrategy": "WRAP"}
+    bold = {"textFormat": {"bold": True}}
+
+    grid = [[cell(f"ИСТОРИЯ {ttl} — заказы по дням (шт)", title_fmt)] + [cell("", title_fmt)] * (n_cols - 1),
+            [cell("Позиция", head_fmt), cell("Бренд", head_fmt)]
+            + [cell(f"{d[8:10]}.{d[5:7]}", head_fmt) for d in all_days]]
+    def series_row(c1, c2, s, label_fmt):
+        vals = [s.get(d, "") or "" for d in all_days]
+        nums = [v for v in vals if isinstance(v, (int, float))]
+        mn, mx = (min(nums), max(nums)) if nums else (0, 0)
+        return [cell(c1, label_fmt), cell(c2, label_fmt)] + [cell(v, heat(v, mn, mx)) for v in vals]
+    for disp in disp_names:
+        grid.append(series_row("Итого", disp, btot.get(disp, {}), bold))
+    grid.append(series_row("Итого", "Все бренды", alld,
+                           {"textFormat": {"bold": True}, "backgroundColor": hexrgb("#FFF200")}))
+    frozen = len(grid)
+    for pos in positions:
+        for disp in disp_names:
+            s = ser.get((pos, disp))
+            if s: grid.append(series_row(pos, disp, s, {}))
+
+    if name not in sheet_props:
+        r = api(f"{BASE}:batchUpdate", {"requests": [{"addSheet": {"properties": {"title": name, "index": 3 + hidx}}}]})
+        sheet_props[name] = r["replies"][0]["addSheet"]["properties"]
+    sid = sheet_props[name]["sheetId"]
+    reqs += [
+        {"unmergeCells": {"range": {"sheetId": sid}}},
+        {"updateCells": {"range": {"sheetId": sid}, "fields": "userEnteredValue,userEnteredFormat,note"}},
+        # сетка по умолчанию — 26 колонок; под все дни истории нужно больше
+        {"updateSheetProperties": {"properties": {"sheetId": sid,
+            "gridProperties": {"columnCount": max(n_cols + 2, 26)}},
+            "fields": "gridProperties.columnCount"}},
+    ]
+    for _ in range(cf_counts.get(name, 0)):
+        reqs.append({"deleteConditionalFormatRule": {"sheetId": sid, "index": 0}})
+    cf_counts[name] = 0
+    reqs += [
+        {"updateSheetProperties": {"properties": {"sheetId": sid, "index": 3 + hidx,
+            "gridProperties": {"frozenRowCount": frozen, "frozenColumnCount": 2}},
+            "fields": "index,gridProperties(frozenRowCount,frozenColumnCount)"}},
+        # мерджить через границу закреплённых колонок нельзя — два отдельных мерджа
+        {"mergeCells": {"range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1,
+            "startColumnIndex": 0, "endColumnIndex": 2}, "mergeType": "MERGE_ALL"}},
+        {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
+            "startIndex": 0, "endIndex": 1}, "properties": {"pixelSize": 340}, "fields": "pixelSize"}},
+        {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
+            "startIndex": 1, "endIndex": 2}, "properties": {"pixelSize": 120}, "fields": "pixelSize"}},
+    ]
+    if all_days:
+        reqs.append({"mergeCells": {"range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1,
+            "startColumnIndex": 2, "endColumnIndex": n_cols}, "mergeType": "MERGE_ALL"}})
+        reqs.append({"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS",
+            "startIndex": 2, "endIndex": n_cols}, "properties": {"pixelSize": 62}, "fields": "pixelSize"}})
+    reqs += [
+        {"updateCells": {"range": {"sheetId": sid, "startRowIndex": 0, "startColumnIndex": 0,
+                                   "endRowIndex": len(grid), "endColumnIndex": n_cols},
+                         "rows": [{"values": rw} for rw in grid],
+                         "fields": "userEnteredValue,userEnteredFormat"}},
+    ]
+    print(f"{name}: {len(grid) - frozen} строк позиция×бренд, {len(all_days)} дн")
+
 # порядок запросов важен — шлём последовательными чанками
 for i in range(0, len(reqs), 300):
     api(f"{BASE}:batchUpdate", {"requests": reqs[i:i+300]})
 verify = api(f"{BASE}/values/{urllib.parse.quote('Общее')}!B2:{col_a1(1+len(BRANDS)+1)}2").get("values", [[]])[0]
 print("VERIFY строка Итого «Общее»:", verify)
+print(f"VERIFY «История Общее» за {DD}: {hist_verify}",
+      "OK" if hist_verify == tot_wb + tot_oz else f"≠ {tot_wb + tot_oz} (MISMATCH)")
 print("DONE")

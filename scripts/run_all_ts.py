@@ -149,6 +149,17 @@ if failed:
         if err: failed[brand] = err
         else: failed.pop(brand)
 
+# сводный отчёт «Общая» (позиции × бренды) — после всех брендов
+if K.get("SVOD_GSHEET_ID"):
+    print("\n=== Сводный отчёт «Общая» ===", flush=True)
+    if sa_valid():
+        r = subprocess.run(["python3", f"{HERE}/svod_report.py", "--keys", KEYS, "--sa", SA],
+                           capture_output=True, text=True)
+        print((r.stdout + r.stderr).strip()[-1500:])
+        if "DONE" not in r.stdout: failed["СВОД"] = "svod_report"
+    else:
+        print("SA недоступен — свод пропущен")
+
 print("\nИТОГ:", "все бренды OK" if not failed else f"ошибки: {failed}")
 if failed:
     tg_alert("⚠️ Отчёт по заказам: сбой по брендам "

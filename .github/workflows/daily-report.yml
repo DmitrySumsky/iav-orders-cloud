@@ -1,4 +1,4 @@
-name: Ежедневный отчёт по заказам WB+Ozon
+name: Ежедневный отчёт по заказам WB+Ozon (TrueStats)
 
 on:
   workflow_dispatch:
@@ -12,10 +12,12 @@ on:
         required: false
         default: ""
   schedule:
-    - cron: "0 0 * * *"   # 03:00 МСК: ночной сбор данных (без отправки в TG, см. SKIP_TG)        # кнопка ручного запуска
+    # 03:45 UTC = 06:45 МСК — подстраховочный сбор БЕЗ отправки (SKIP_TG).
+    # Боевая отправка в 07:30 МСК приходит через cron-job.org -> workflow_dispatch.
+    - cron: "45 3 * * *"
 
 permissions:
-  contents: write           # чтобы коммитить накопленную историю обратно
+  contents: write           # коммит накопленной истории обратно
 
 concurrency:
   group: daily-report
@@ -23,8 +25,8 @@ concurrency:
 
 jobs:
   report:
-    runs-on: self-hosted
-    timeout-minutes: 300
+    runs-on: ubuntu-latest   # TrueStats-ядро собирается за минуты — облака хватает
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -44,7 +46,7 @@ jobs:
           printf '%s' "$API_KEYS" > api_keys.txt
           printf '\n%s\n' "$API_KEYS_EXTRA" >> api_keys.txt
           printf '%s' "$SA_JSON" > google_sa.json
-          python3 -c "import json; print('SA JSON валиден, client_email:', json.load(open('google_sa.json'))['client_email'])"
+          python3 -c "import json; print('SA:', json.load(open('google_sa.json')).get('client_email'))" || echo "SA нет — Google Sheets будут пропущены"
 
       - name: Конвейер по всем брендам
         env:
@@ -52,7 +54,7 @@ jobs:
           SKIP_TG: ${{ github.event_name == 'schedule' && '1' || github.event.inputs.skip_tg }}
           HISTORY_DAYS: "8"
           BRANDS: ${{ github.event.inputs.brands || 'NATURI,4ME,HEALTH FORM,SUNSHINE,VEXOR,ORZAX,LOVE&DOVE' }}
-        run: python3 -u scripts/run_all.py
+        run: python3 -u scripts/run_all_ts.py
 
       - name: Сохранить историю (коммит state/)
         if: always()
@@ -62,7 +64,9 @@ jobs:
           git config user.email "bot@users.noreply.github.com"
           git add state/
           git diff --cached --quiet || git commit -m "история за $(date -u +%F)"
+          git pull --rebase origin main || true
           git push
+        continue-on-error: true
 
       - name: Excel-файлы как артефакт
         if: always()

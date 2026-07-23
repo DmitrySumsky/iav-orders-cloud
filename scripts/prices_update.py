@@ -45,12 +45,24 @@ def token_of(sa_path):
     return json.loads(urllib.request.urlopen(urllib.request.Request(
         "https://oauth2.googleapis.com/token", data=body), timeout=30).read())["access_token"]
 
-def api(path, tok, method="GET", body=None):
+def api(path, tok, method="GET", body=None, tries=5):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(BASE + path, data=data,
         headers={"Authorization": "Bearer " + tok, "Content-Type": "application/json"}, method=method)
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return json.loads(r.read())
+    for attempt in range(tries):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            # 429/5xx у Google Sheets — транзиентные (сегодня утренний прогон
+            # упал на разовом 503); ретраим с backoff, 4xx (кроме 429) — сразу
+            if e.code in (429, 500, 502, 503, 504) and attempt < tries - 1:
+                time.sleep(min(30, 3 * (2 ** attempt))); continue
+            raise
+        except (urllib.error.URLError, TimeoutError, OSError):
+            if attempt < tries - 1:
+                time.sleep(min(30, 3 * (2 ** attempt))); continue
+            raise
 
 def col_letter(i0):
     s, i = "", i0 + 1

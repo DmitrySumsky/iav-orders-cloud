@@ -126,7 +126,10 @@ for part in raw.split(","):
     part = part.strip()
     if not part: continue
     if ":" in part.lstrip("-"):
-        cid, thr = part.rsplit(":", 1); TARGETS.append((cid, thr))
+        cid, thr = part.rsplit(":", 1)
+        # топик 1 форума = «General»: Telegram требует НЕ слать message_thread_id
+        # (иначе sendPhoto → 400 «message thread not found»)
+        TARGETS.append((cid, None if thr.strip() == "1" else thr))
     else:
         TARGETS.append((part, None))
 if not TOK or not TARGETS:

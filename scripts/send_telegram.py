@@ -48,7 +48,8 @@ for part in raw.split(","):
     if not part: continue
     if ":" in part.lstrip("-"):
         cid, thr = part.rsplit(":", 1)
-        TARGETS.append((cid, thr))
+        # топик 1 форума = «General»: слать без message_thread_id (иначе 400)
+        TARGETS.append((cid, None if thr.strip() == "1" else thr))
     else:
         TARGETS.append((part, None))
 if not TOK or not TARGETS:

@@ -67,7 +67,8 @@ def tg_send(chats, text):
         if not pair: continue
         cid, _, topic = pair.partition(":")
         params = {"chat_id": cid, "text": text}
-        if topic: params["message_thread_id"] = topic
+        # топик 1 форума = «General»: слать без message_thread_id (иначе 400)
+        if topic and topic.strip() != "1": params["message_thread_id"] = topic
         try:
             body = urllib.parse.urlencode(params).encode()
             urllib.request.urlopen(

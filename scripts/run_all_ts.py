@@ -238,16 +238,21 @@ if K.get("PRICES_GSHEET_ID"):
     st = STATUS.setdefault("Цены WB+Ozon", {"Сбор данных": "—", "Google-таблица": "—",
                                             "Telegram": "—", "Детали": ""})
     if sa_valid():
-        r = subprocess.run(["python3", f"{HERE}/prices_update.py", "--keys", KEYS,
-                            "--sa", SA, "--sheet-id", K["PRICES_GSHEET_ID"]],
-                           capture_output=True, text=True)
-        print((r.stdout + r.stderr).strip()[-1500:])
-        if "DONE" not in r.stdout:
+        # PRICES_GSHEET_ID — одна или несколько таблиц через запятую (БАДы, автохимия)
+        ids = [s.strip() for s in K["PRICES_GSHEET_ID"].split(",") if s.strip()]
+        ok, filled = True, []
+        for sid in ids:
+            r = subprocess.run(["python3", f"{HERE}/prices_update.py", "--keys", KEYS,
+                                "--sa", SA, "--sheet-id", sid],
+                               capture_output=True, text=True)
+            print((r.stdout + r.stderr).strip()[-1500:])
+            if "DONE" not in r.stdout: ok = False
+            filled += [l.strip() for l in r.stdout.splitlines() if "залито ячеек" in l]
+        if not ok:
             failed["ЦЕНЫ"] = "prices_update"
             st["Сбор данных"] = st["Google-таблица"] = "❌"
         else:
             st["Сбор данных"] = st["Google-таблица"] = "✅"
-            filled = [l.strip() for l in r.stdout.splitlines() if "залито ячеек" in l]
             st["Детали"] = "; ".join(filled)[:200]
     else:
         print("SA недоступен — цены пропущены"); st["Google-таблица"] = "нет SA"

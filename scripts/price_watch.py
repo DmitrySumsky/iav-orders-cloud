@@ -24,6 +24,7 @@ import jwt
 
 BASE = "https://sheets.googleapis.com/v4/spreadsheets/"
 MON_TITLE = "Мониторинг цен"
+SUMMARY_ROW = 7                  # строка «Сейчас: дороже N из M …» над заголовками
 HEAD_ROW = 9                     # строка заголовков таблицы состояния (1-based)
 FIRST_DATA_ROW = HEAD_ROW + 1
 MSK = timezone(timedelta(hours=3))
@@ -39,7 +40,107 @@ HYST_EXIT = 0.0
 # сколько товарных групп разбирать подробно, остальные — одной строкой
 DETAIL_GROUPS = 12
 
+# порядок строк в листе: самое горячее наверх
+RANK = {"дороже": 0, "ок": 1, "нет конкурентов": 2, "нет цены": 3}
+# ширины колонок листа (px), под COLS; последняя (тех. поле) прячется
+WIDTHS = [95, 300, 105, 90, 165, 90, 85, 90, 105, 100, 105, 105, 120]
+# заливка строки по величине отставания от минимума конкурента: чем краснее,
+# тем срочнее. Границы в %, цвета — стандартная красная шкала Google Sheets
+BANDS = [(15.0, "#E06666", True), (8.0, "#EA9999", False),
+         (3.0, "#F4CCCC", False), (0.0, "#FCE8E6", False)]
+WHITE, GRAY = "#FFFFFF", "#EFEFEF"
+
 esc = lambda s: html.escape(str(s), quote=True)
+
+
+def rgb(hexstr):
+    h = hexstr.lstrip("#")
+    return {"red": int(h[0:2], 16) / 255, "green": int(h[2:4], 16) / 255,
+            "blue": int(h[4:6], 16) / 255}
+
+
+def row_style(row):
+    """Цвет и жирность строки листа по её статусу и отставанию."""
+    status, d_min = row[10], row[6]
+    if status == "дороже" and isinstance(d_min, (int, float)):
+        for edge, color, bold in BANDS:
+            if d_min >= edge:
+                return color, bold
+        return BANDS[-1][1], False
+    if status in ("нет цены", "нет конкурентов"):
+        return GRAY, False
+    return WHITE, False
+
+
+def decorate(sheet_id, tok, gid, out, need_rows, has_alerts):
+    """Оформление листа: заливка строк по остроте, форматы чисел, ширины.
+
+    Цвета считаются здесь и кладутся статикой, а НЕ условным форматированием:
+    правил расплодились бы сотни (та же причина, что в svod_report).
+    Строки уже отсортированы по остроте, поэтому одинаковые цвета идут подряд
+    и вся заливка укладывается в несколько repeatCell вместо строки на каждую.
+    """
+    reqs = [{"updateDimensionProperties": {
+                "range": {"sheetId": gid, "dimension": "COLUMNS",
+                          "startIndex": i, "endIndex": i + 1},
+                "properties": {"pixelSize": w}, "fields": "pixelSize"}}
+            for i, w in enumerate(WIDTHS)]
+    reqs.append({"updateDimensionProperties": {           # тех. поле анти-спама
+        "range": {"sheetId": gid, "dimension": "COLUMNS",
+                  "startIndex": len(COLS) - 1, "endIndex": len(COLS)},
+        "properties": {"hiddenByUser": True}, "fields": "hiddenByUser"}})
+
+    body = {"startRowIndex": FIRST_DATA_ROW - 1, "endRowIndex": need_rows,
+            "startColumnIndex": 0, "endColumnIndex": len(COLS)}
+    reqs.append({"repeatCell": {"range": {"sheetId": gid, **body},
+        "cell": {"userEnteredFormat": {"backgroundColor": rgb(WHITE),
+                                       "textFormat": {"bold": False}}},
+        "fields": "userEnteredFormat(backgroundColor,textFormat.bold)"}})
+
+    band_start, band_style, i = 0, None, 0
+    for i, row in enumerate(out):
+        st = row_style(row)
+        if band_style is None:
+            band_style = st
+        elif st != band_style:
+            reqs.append(paint(gid, FIRST_DATA_ROW - 1 + band_start,
+                              FIRST_DATA_ROW - 1 + i, band_style))
+            band_start, band_style = i, st
+    if out and band_style is not None:
+        reqs.append(paint(gid, FIRST_DATA_ROW - 1 + band_start,
+                          FIRST_DATA_ROW - 1 + len(out), band_style))
+
+    for cols, fmt in (((3, 4), None), ((5, 6), None), ((7, 8), None),
+                      ((6, 7), '0.0"%"'), ((8, 9), '0.0"%"')):
+        pattern = fmt or '#,##0" ₽"'
+        reqs.append({"repeatCell": {
+            "range": {"sheetId": gid, "startRowIndex": FIRST_DATA_ROW - 1,
+                      "endRowIndex": need_rows,
+                      "startColumnIndex": cols[0], "endColumnIndex": cols[1]},
+            "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER",
+                                                            "pattern": pattern}}},
+            "fields": "userEnteredFormat.numberFormat"}})
+
+    reqs.append({"repeatCell": {
+        "range": {"sheetId": gid, "startRowIndex": SUMMARY_ROW - 1,
+                  "endRowIndex": SUMMARY_ROW, "startColumnIndex": 0,
+                  "endColumnIndex": len(COLS)},
+        "cell": {"userEnteredFormat": {
+            "backgroundColor": rgb("#F4CCCC" if has_alerts else "#D9EAD3"),
+            "textFormat": {"bold": True}}},
+        "fields": "userEnteredFormat(backgroundColor,textFormat.bold)"}})
+
+    api(sheet_id + ":batchUpdate", tok, "POST", {"requests": reqs})
+
+
+def paint(gid, r0, r1, style):
+    color, bold = style
+    return {"repeatCell": {
+        "range": {"sheetId": gid, "startRowIndex": r0, "endRowIndex": r1,
+                  "startColumnIndex": 0, "endColumnIndex": len(COLS)},
+        "cell": {"userEnteredFormat": {"backgroundColor": rgb(color),
+                                       "textFormat": {"bold": bold}}},
+        "fields": "userEnteredFormat(backgroundColor,textFormat.bold)"}}
 
 
 def say(msg):
@@ -61,15 +162,23 @@ def load_keys(paths):
     return d
 
 
-def token_of(sa_path):
+def token_of(sa_path, tries=4):
+    """Токен сервисного аккаунта. С ретраем: разовый таймаут на выдаче токена
+    иначе убивает весь часовой прогон ещё до первого запроса к таблице."""
     SA = json.load(open(sa_path)); now = int(time.time())
     a_ = jwt.encode({"iss": SA["client_email"], "scope": "https://www.googleapis.com/auth/spreadsheets",
                      "aud": "https://oauth2.googleapis.com/token", "iat": now, "exp": now + 3600},
                     SA["private_key"], algorithm="RS256")
     body = urllib.parse.urlencode({"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
                                    "assertion": a_}).encode()
-    return json.loads(urllib.request.urlopen(urllib.request.Request(
-        "https://oauth2.googleapis.com/token", data=body), timeout=30).read())["access_token"]
+    for attempt in range(tries):
+        try:
+            return json.loads(urllib.request.urlopen(urllib.request.Request(
+                "https://oauth2.googleapis.com/token", data=body), timeout=30).read())["access_token"]
+        except Exception:
+            if attempt == tries - 1:
+                raise
+            time.sleep(min(20, 3 * (2 ** attempt)))
 
 
 def api(path, tok, method="GET", body=None, tries=5):
@@ -442,7 +551,13 @@ def main():
     if a.dry_run:
         print("dry-run: лист не изменён"); print("DONE"); return
 
-    order = sorted(cur.items(), key=lambda kv: (kv[1]["group"], kv[1]["brand"]))
+    # Порядок = приоритет: сначала где мы дороже всего, потом «ок» (ближайшие к
+    # порогу выше), в конце — строки без сравнения. Лист читают сверху вниз и
+    # обычно только верх, поэтому сортировка тут важнее алфавита.
+    order = sorted(cur.items(), key=lambda kv: (
+        RANK.get(kv[1]["status"], 9),
+        -(kv[1]["d_min"] if kv[1]["d_min"] is not None else -999),
+        kv[1]["group"], kv[1]["brand"]))
     out = []
     for key, s in order:
         art = key[0]
@@ -458,18 +573,27 @@ def main():
                     s["cheaper"] if s["cheaper"] is not None else "",
                     s["status"], now_s, pts if pts is not None else ""])
 
+    top_n = sum(1 for s in cur.values() if s["status"] == "дороже" and s["top"])
+    no_price = sum(1 for s in cur.values() if s["status"] == "нет цены")
+    summary = (f"дороже конкурентов: {total_over} из {len(cur)}"
+               + (f" · дороже ВСЕХ в группе: {top_n}" if top_n else "")
+               + (f" · без цены (нет в наличии): {no_price}" if no_price else "")
+               + f" · обновлено {now_s} МСК")
+
     need_rows = FIRST_DATA_ROW + len(out) + 20
+    last = col_letter(len(COLS) - 1)
     api(a.sheet_id + ":batchUpdate", tok, "POST", {"requests": [
         {"updateSheetProperties": {"properties": {"sheetId": gid,
                                                   "gridProperties": {"rowCount": need_rows,
                                                                      "columnCount": len(COLS)}},
                                    "fields": "gridProperties(rowCount,columnCount)"}}]})
-    last = col_letter(len(COLS) - 1)
     api(f"{a.sheet_id}/values/'{urllib.parse.quote(MON_TITLE)}'!A{FIRST_DATA_ROW}:{last}2000:clear",
         tok, "POST", {})
     api(a.sheet_id + "/values:batchUpdate", tok, "POST", {"valueInputOption": "USER_ENTERED",
-        "data": [{"range": f"'{MON_TITLE}'!A{FIRST_DATA_ROW}", "values": out}]})
-    print(f"лист «{MON_TITLE}»: записано {len(out)} строк")
+        "data": [{"range": f"'{MON_TITLE}'!A{SUMMARY_ROW}", "values": [["Сейчас", summary]]},
+                 {"range": f"'{MON_TITLE}'!A{FIRST_DATA_ROW}", "values": out}]})
+    decorate(a.sheet_id, tok, gid, out, need_rows, bool(total_over))
+    print(f"лист «{MON_TITLE}»: записано {len(out)} строк, наверху — {out[0][1] if out else '—'}")
     print("DONE")
 
 

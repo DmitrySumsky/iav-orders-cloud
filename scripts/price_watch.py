@@ -24,15 +24,22 @@ import jwt
 
 BASE = "https://sheets.googleapis.com/v4/spreadsheets/"
 MON_TITLE = "Мониторинг цен"
-SUMMARY_ROW = 7                  # строка «Сейчас: дороже N из M …» над заголовками
-HEAD_ROW = 9                     # строка заголовков таблицы состояния (1-based)
-FIRST_DATA_ROW = HEAD_ROW + 1
 MSK = timezone(timedelta(hours=3))
 COLS = ["Артикул", "Товар (группа)", "Бренд", "Наша цена", "Мин. конкурент",
         "Цена мин.", "% к мин.", "Медиана", "% к медиане", "Дешевле нас",
         "Статус", "Обновлено", "% при уведомлении"]
 DEFAULTS = {"Порог, %": "5", "Получатели TG": "", "Часы работы (МСК)": "0-23",
-            "Включён": "да", "Наши бренды": "NATURI, SUNSHINE, Health Form, 4ME, VEXOR, ORZAX"}
+            "Включён": "да", "Наши бренды": "NATURI, SUNSHINE, Health Form, 4ME, VEXOR, ORZAX",
+            "Разбивать по брендам": "нет", "Чаты по брендам": ""}
+# Раскладка листа СЧИТАЕТСЯ от числа настроек, а не забита числами: иначе новая
+# строка настроек молча наезжает на строку «Сейчас» и затирает её значение.
+# 1 — заголовок, 2..N+1 — настройки, N+2 — пусто, N+3 — «Сейчас», N+4 — шапка.
+SUMMARY_ROW = len(DEFAULTS) + 3
+HEAD_ROW = len(DEFAULTS) + 4
+FIRST_DATA_ROW = HEAD_ROW + 1
+NOTE = ("порог работает в обе стороны: на столько % дороже минимума конкурентов "
+        "(теряем продажи) или дешевле его же (отдаём маржу). «Чаты по брендам»: "
+        "NATURI=-100…:5, SUNSHINE=-100…:7 — пусто = берётся из ключей отчёта")
 # повторное уведомление по той же позиции — только если разрыв вырос на столько п.п.
 REALERT_STEP = 3.0
 # Гистерезис: вход в сигнал по порогу, выход — когда разрыв ужался до половины
@@ -292,25 +299,58 @@ def ensure_monitor(sheet_id, tok, sheets, tg_default):
     vals = api(f"{sheet_id}/values/{q}!A1:M2000?valueRenderOption=FORMATTED_VALUE",
                tok).get("values", [])
 
-    # шапка отсутствует (новый лист или прошлый прогон оборвался) — записать
-    head_ok = len(vals) >= HEAD_ROW and (vals[HEAD_ROW - 1][:1] or [""])[0].strip() == COLS[0]
-    if not head_ok:
-        print("  пишу настройки и заголовки")
-        d = dict(DEFAULTS); d["Получатели TG"] = tg_default
+    # где шапка таблицы стоит СЕЙЧАС: раскладка могла быть сделана прошлой
+    # версией скрипта с другим числом настроек
+    old_head = None
+    for idx, row in enumerate(vals[:30], 1):
+        if row and row[0].strip() == COLS[0]:
+            old_head = idx
+            break
+
+    cfg = dict(DEFAULTS)
+    for row in vals[:(old_head - 1) if old_head else 30]:
+        if len(row) > 1 and row[0].strip() in DEFAULTS:
+            cfg[row[0].strip()] = row[1].strip()
+    if not cfg["Получатели TG"].strip():
+        cfg["Получатели TG"] = tg_default
+
+    state = {}
+    if old_head:
+        for row in vals[old_head:]:
+            art = (row[0].strip() if row else "")
+            # ключ — пара «артикул + группа»: один и тот же nmID конкурента (и наш)
+            # может стоять сразу в нескольких товарных группах (боевой случай VEXOR)
+            grp = (row[1].strip() if len(row) > 1 else "")
+            if art.isdigit():
+                state[(art, grp)] = {"статус": (row[10].strip() if len(row) > 10 else ""),
+                                     "пункты": as_num(row[12]) if len(row) > 12 else None}
+
+    if old_head != HEAD_ROW:
+        # Перекладываем верх листа: настройки записываем ТЕКУЩИМИ значениями
+        # (иначе правки пользователя сбросятся на дефолты), состояние уже прочитано
+        # выше, а данные всё равно переписываются каждый прогон.
+        print(f"  раскладка: шапка {old_head or 'отсутствует'} → строка {HEAD_ROW}")
+        api(f"{sheet_id}/values/{q}!A1:M2000:clear", tok, "POST", {})
         blank = [""] * len(COLS)
-        # строки шапки пишем на всю ширину: иначе остатки прошлой (сбойной) шапки
-        # переживут перезапись, потому что values.update трогает только переданные ячейки
-        rows = [["Настройки мониторинга цен", "",
-                 "порог работает в обе стороны: на столько % дороже минимума конкурентов "
-                 "(теряем продажи) или дешевле его же (отдаём маржу)"]
-                + [""] * (len(COLS) - 3)]
-        rows += [[k, v] + [""] * (len(COLS) - 2) for k, v in d.items()]
-        while len(rows) < HEAD_ROW - 1:      # заголовки обязаны попасть ровно в HEAD_ROW
-            rows.append(list(blank))
-        rows += [COLS]
+        # строки пишем на всю ширину: values.update трогает только переданные
+        # ячейки, и остатки прежней раскладки иначе переживут перезапись
+        rows = [["Настройки мониторинга цен", "", NOTE] + [""] * (len(COLS) - 3)]
+        rows += [[k, cfg[k]] + [""] * (len(COLS) - 2) for k in DEFAULTS]
+        rows.append(list(blank))
+        rows.append(["Сейчас", ""] + [""] * (len(COLS) - 2))
+        rows.append(list(COLS))
+        assert len(rows) == HEAD_ROW, (len(rows), HEAD_ROW)
         api(sheet_id + "/values:batchUpdate", tok, "POST", {"valueInputOption": "USER_ENTERED",
             "data": [{"range": f"'{MON_TITLE}'!A1", "values": rows}]})
         api(sheet_id + ":batchUpdate", tok, "POST", {"requests": [
+            # сбросить заливку прежней раскладки: старая строка «Сейчас» иначе
+            # останется розовой уже на месте обычной настройки
+            {"repeatCell": {"range": {"sheetId": props["sheetId"], "startRowIndex": 0,
+                                      "endRowIndex": HEAD_ROW, "startColumnIndex": 0,
+                                      "endColumnIndex": len(COLS)},
+                            "cell": {"userEnteredFormat": {"backgroundColor": rgb(WHITE),
+                                                           "textFormat": {"bold": False}}},
+                            "fields": "userEnteredFormat(backgroundColor,textFormat.bold)"}},
             {"repeatCell": {"range": {"sheetId": props["sheetId"], "startRowIndex": 0, "endRowIndex": 1},
                             "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
                             "fields": "userEnteredFormat.textFormat.bold"}},
@@ -321,23 +361,6 @@ def ensure_monitor(sheet_id, tok, sheets, tg_default):
             {"updateSheetProperties": {"properties": {"sheetId": props["sheetId"],
                                                       "gridProperties": {"frozenRowCount": HEAD_ROW}},
                                        "fields": "gridProperties.frozenRowCount"}}]})
-        vals = api(f"{sheet_id}/values/{q}!A1:M2000?valueRenderOption=FORMATTED_VALUE",
-                   tok).get("values", [])
-    cfg = dict(DEFAULTS)
-    for row in vals[:HEAD_ROW - 1]:
-        if len(row) > 1 and row[0].strip() in DEFAULTS:
-            cfg[row[0].strip()] = row[1].strip()
-    if not cfg["Получатели TG"].strip():
-        cfg["Получатели TG"] = tg_default
-    state = {}
-    for row in vals[FIRST_DATA_ROW - 1:]:
-        art = (row[0].strip() if row else "")
-        # ключ — пара «артикул + группа»: один и тот же nmID конкурента (и наш)
-        # может стоять сразу в нескольких товарных группах (боевой случай VEXOR)
-        grp = (row[1].strip() if len(row) > 1 else "")
-        if art.isdigit():
-            state[(art, grp)] = {"статус": (row[10].strip() if len(row) > 10 else ""),
-                                 "пункты": as_num(row[12]) if len(row) > 12 else None}
     return props["sheetId"], cfg, state
 
 
@@ -405,6 +428,17 @@ def main():
     gid, cfg, prev = ensure_monitor(a.sheet_id, tok, sheets, K.get("PRICE_WATCH_TG_CHATS", ""))
     thr_pct = as_num(cfg["Порог, %"]) or 5.0
     ours = {b.strip().lower() for b in cfg["Наши бренды"].split(",") if b.strip()}
+    default_targets = parse_targets(cfg["Получатели TG"])
+    split_brands = cfg["Разбивать по брендам"].strip().lower() in ("да", "yes", "1", "true")
+    # «Чаты по брендам»: NATURI=-100123:5, SUNSHINE=-100123:7 — перекрывает api_keys
+    route_map = {}
+    for part in cfg["Чаты по брендам"].split(","):
+        if "=" in part:
+            b, dst = part.split("=", 1)
+            if b.strip() and dst.strip():
+                route_map[b.strip().lower()] = parse_targets(dst)
+    print(f"рассылка: {'по брендам' if split_brands else 'общая'}"
+          + (f", переопределений в листе {len(route_map)}" if route_map else ""))
     print(f"{book}: порог {thr_pct}%, наши бренды {sorted(ours)}, окно {cfg['Часы работы (МСК)']}")
     if cfg["Включён"].strip().lower() not in ("да", "yes", "1", "true"):
         print("Мониторинг выключен в настройках листа"); print("DONE"); return
@@ -505,14 +539,27 @@ def main():
           f"дешевле на >{thr_pct}%: {total_under}, новых сигналов: {len(alerts)}, "
           f"вернулись к рынку: {len(recovered)}")
 
-    # ----- сообщение -----
-    sent_keys = set()
-    if alerts or recovered:
-        lines = []
+    # ----- сообщения (по адресатам) -----
+    def targets_for(brand):
+        """Куда слать сигнал по этому бренду. Пока разбивка выключена — всем в
+        общий адрес. Включённая ищет бренд в настройке листа, затем в api_keys
+        (`<PREFIX>_TG_CHATS` — те же чаты, что у утреннего отчёта), и только
+        потом падает на общий адрес."""
+        if not split_brands:
+            return default_targets
+        b = brand.strip().lower()
+        if b in route_map:
+            return route_map[b]
+        raw = K.get(re.sub(r"[^A-Z0-9]", "", brand.upper()) + "_TG_CHATS", "")
+        return parse_targets(raw) if raw else default_targets
+
+    def build_message(part_alerts, part_recovered, scope):
+        """Текст для одного адресата + ключи, которые в него вошли."""
+        lines, keys = [], set()
 
         def section(head, entries_list, sign):
-            """Блок сообщения. sign=+1 — мы дороже, -1 — мы дешевле; знак задаёт
-            и порядок: сначала самый большой разрыв в свою сторону."""
+            # sign=+1 — мы дороже, -1 — мы дешевле; знак задаёт и порядок:
+            # сначала самый большой разрыв в свою сторону
             if not entries_list:
                 return
             by_group = {}
@@ -533,7 +580,7 @@ def main():
                     url = f"https://www.wildberries.ru/catalog/{key[0]}/detail.aspx"
                     lines.append(f"{mark}• <a href=\"{url}\">{esc(s['brand'])}</a> {s['price']} ₽ — "
                                  f"{s['d_min']:+}% к мин., {s['d_med']:+}% к медиане{flag}")
-                    sent_keys.add(key)
+                    keys.add(key)
                 lines.append("")
             tail = ordered[DETAIL_GROUPS:]
             if tail:
@@ -542,51 +589,75 @@ def main():
                     for key, s, kind in sorted(entries, key=lambda x: -sign * x[1]["d_min"]):
                         lines.append(f"• {esc(gname)} — {esc(s['brand'])} {s['price']} ₽ "
                                      f"({s['d_min']:+}% к мин. {s['min']} ₽)")
-                        sent_keys.add(key)
+                        keys.add(key)
                 lines.append("")
 
-        up = [x for x in alerts if x[1]["status"] == "дороже"]
-        down = [x for x in alerts if x[1]["status"] == "дешевле"]
-        lines.append(f"📊 <b>Цены — {now_s} МСК</b>")
-        lines.append(f"дороже конкурентов: {total_over} из {len(cur)} · "
-                     f"дешевле рынка: {total_under} · порог {thr_pct}%")
+        brands = sorted({s["brand"] for s in scope})
+        head_brand = (brands[0] if len(brands) == 1 else ", ".join(brands)[:60])
+        over = sum(1 for s in scope if s["status"] == "дороже")
+        under = sum(1 for s in scope if s["status"] == "дешевле")
+        lines.append(f"📊 <b>{esc(head_brand)} — цены на {now_s} МСК</b>")
+        lines.append(f"дороже конкурентов: {over} из {len(scope)} · "
+                     f"дешевле рынка: {under} · порог {thr_pct}%")
         lines.append("")
-        section("⚠️ <b>СТАЛИ ДОРОЖЕ</b> — {n} позиций по {g} товарам", up, 1)
+        section("⚠️ <b>СТАЛИ ДОРОЖЕ</b> — {n} позиций по {g} товарам",
+                [x for x in part_alerts if x[1]["status"] == "дороже"], 1)
         section("💰 <b>СИЛЬНО ДЕШЕВЛЕ ВСЕХ</b> — {n} позиций по {g} товарам, "
-                "можно поднять цену", down, -1)
-        if recovered:
-            lines.append(f"✅ <b>Вернулись к рынку: {len(recovered)}</b>")
-            for key, s, was_st in recovered:
+                "можно поднять цену",
+                [x for x in part_alerts if x[1]["status"] == "дешевле"], -1)
+        if part_recovered:
+            lines.append(f"✅ <b>Вернулись к рынку: {len(part_recovered)}</b>")
+            for key, s, was_st in part_recovered:
                 lines.append(f"• {esc(s['group'])} — {esc(s['brand'])} {s['price']} ₽ "
                              f"(было «{was_st}», сейчас {s['d_min']:+}% к мин. {s['min']} ₽)")
-                sent_keys.add(key)
+                keys.add(key)
             lines.append("")
         lines.append(f"<a href=\"https://docs.google.com/spreadsheets/d/{a.sheet_id}/edit\">"
                      f"Таблица цен</a>")
-        text = "\n".join(lines)
+        return "\n".join(lines), keys
 
-        targets = parse_targets(cfg["Получатели TG"])
-        if a.dry_run:
-            print("\n----- сообщение (dry-run, не отправлено) -----")
-            print(text)
-        elif not tg_token or not targets:
-            print("ВНИМАНИЕ: нет TELEGRAM_BOT_TOKEN или получателей — сообщение не отправлено")
-            sent_keys = set()
-        else:
-            chunks, buf = [], ""      # лимит Telegram — 4096 символов на сообщение
-            for block in text.split("\n\n"):
-                if buf and len(buf) + len(block) + 2 > 3500:
-                    chunks.append(buf); buf = block
-                else:
-                    buf = (buf + "\n\n" + block) if buf else block
-            if buf:
-                chunks.append(buf)
-            for c in [c for c in chunks if c.strip()]:
-                if not tg_send(tg_token, targets, c):
-                    sent_keys = set()   # не отмечаем как отправленное — повторим в следующий час
-                    break
+    def send_chunked(targets, text):
+        chunks, buf = [], ""      # лимит Telegram — 4096 символов на сообщение
+        for block in text.split("\n\n"):
+            if buf and len(buf) + len(block) + 2 > 3500:
+                chunks.append(buf); buf = block
+            else:
+                buf = (buf + "\n\n" + block) if buf else block
+        if buf:
+            chunks.append(buf)
+        for c in [c for c in chunks if c.strip()]:
+            if not tg_send(tg_token, targets, c):
+                return False
+        return True
+
+    sent_keys = set()
+    if alerts or recovered:
+        # раскладываем сигналы по адресатам: у каждого чата своё сообщение и
+        # свои счётчики, чтобы бренду не прилетала чужая статистика
+        routes = {}
+        for item in alerts:
+            routes.setdefault(tuple(targets_for(item[1]["brand"])),
+                              {"a": [], "r": []})["a"].append(item)
+        for item in recovered:
+            routes.setdefault(tuple(targets_for(item[1]["brand"])),
+                              {"a": [], "r": []})["r"].append(item)
+
+        for targets, data in routes.items():
+            brands_here = {s["brand"] for _, s, *_ in data["a"] + data["r"]}
+            scope = [s for s in cur.values() if s["brand"] in brands_here]
+            text, keys = build_message(data["a"], data["r"], scope)
+            who = ", ".join(c + (":" + t if t else "") for c, t in targets) or "—"
+            if a.dry_run:
+                print(f"\n----- сообщение для {who} (dry-run, не отправлено) -----")
+                print(text)
+                continue
+            if not tg_token or not targets:
+                print(f"ВНИМАНИЕ: некуда слать ({who}) — сообщение пропущено")
+                continue
+            if send_chunked(list(targets), text):
+                sent_keys |= keys      # иначе не помечаем: повторим в следующий прогон
     else:
-        print("новых сигналов нет — сообщение не отправлено")
+        print("новых сигналов нет — сообщения не отправлялись")
 
     # ----- состояние в лист -----
     if a.dry_run:

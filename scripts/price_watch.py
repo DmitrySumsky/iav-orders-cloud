@@ -209,9 +209,12 @@ def ensure_monitor(sheet_id, tok, sheets, tg_default):
     state = {}
     for row in vals[FIRST_DATA_ROW - 1:]:
         art = (row[0].strip() if row else "")
+        # ключ — пара «артикул + группа»: один и тот же nmID конкурента (и наш)
+        # может стоять сразу в нескольких товарных группах (боевой случай VEXOR)
+        grp = (row[1].strip() if len(row) > 1 else "")
         if art.isdigit():
-            state[art] = {"статус": (row[10].strip() if len(row) > 10 else ""),
-                          "пункты": as_num(row[12]) if len(row) > 12 else None}
+            state[(art, grp)] = {"статус": (row[10].strip() if len(row) > 10 else ""),
+                                 "пункты": as_num(row[12]) if len(row) > 12 else None}
     return props["sheetId"], cfg, state
 
 
@@ -333,7 +336,8 @@ def main():
                 st["comp_n"] = len(comp)
                 st["top"] = st["cheaper"] == len(comp) and len(comp) > 0
 
-            was = prev.get(i["art"], {})
+            key = (i["art"], g)
+            was = prev.get(key, {})
             was_st, was_pts = was.get("статус", ""), was.get("пункты")
             # «уже уведомляли» = не просто статус в листе, а записанные п.п. отставания:
             # если отправка в TG упала, пункты не проставились и сигнал повторится
@@ -348,14 +352,14 @@ def main():
                     else ("дороже" if st["d_min"] > thr_pct else "ок")
             elif st["price"]:
                 st["status"] = "нет конкурентов"
-            cur[i["art"]] = st
+            cur[key] = st
 
             if st["status"] == "дороже":
                 grew = was_pts is not None and st["d_min"] >= was_pts + REALERT_STEP
                 if a.force or not notified or grew:
-                    alerts.append((i["art"], st, "рост" if (grew and notified) else "новое"))
+                    alerts.append((key, st, "рост" if (grew and notified) else "новое"))
             elif st["status"] == "ок" and notified:
-                recovered.append((i["art"], st))
+                recovered.append((key, st))
 
     now_s = f"{datetime.now(MSK):%d.%m %H:%M}"
     total_over = sum(1 for s in cur.values() if s["status"] == "дороже")
@@ -363,13 +367,13 @@ def main():
           f"новых сигналов: {len(alerts)}, вернулись в рынок: {len(recovered)}")
 
     # ----- сообщение -----
-    sent_arts = set()
+    sent_keys = set()
     if alerts or recovered:
         # одна наша группа = один блок: в группе до 4 наших брендов, и повторять
         # для каждого «мин. конкурент / медиана» — это то же самое четыре раза
         by_group = {}
-        for art, s, kind in alerts:
-            by_group.setdefault(s["group"], []).append((art, s, kind))
+        for key, s, kind in alerts:
+            by_group.setdefault(s["group"], []).append((key, s, kind))
         ordered = sorted(by_group.items(), key=lambda kv: -max(x[1]["d_min"] for x in kv[1]))
 
         lines = [f"⚠️ <b>Мы дороже конкурентов</b> — {now_s} МСК" if alerts
@@ -383,29 +387,29 @@ def main():
                 lines.append(f"<b>{esc(gname)}</b>")
                 lines.append(f"мин. {esc(s0['min_who'])} {s0['min']} ₽ · медиана {s0['med']} ₽ · "
                              f"конкурентов {s0.get('comp_n', 0)}")
-                for art, s, kind in sorted(entries, key=lambda x: -x[1]["d_min"]):
+                for key, s, kind in sorted(entries, key=lambda x: -x[1]["d_min"]):
                     mark = "📈 " if kind == "рост" else ""
                     flag = " ‼️ дороже всех" if s["top"] else ""
-                    url = f"https://www.wildberries.ru/catalog/{art}/detail.aspx"
+                    url = f"https://www.wildberries.ru/catalog/{key[0]}/detail.aspx"
                     lines.append(f"{mark}• <a href=\"{url}\">{esc(s['brand'])}</a> {s['price']} ₽ — "
                                  f"+{s['d_min']}% к мин., {s['d_med']:+}% к медиане{flag}")
-                    sent_arts.add(art)
+                    sent_keys.add(key)
                 lines.append("")
             tail = ordered[DETAIL_GROUPS:]
             if tail:
                 lines.append(f"<b>Ещё {sum(len(e) for _, e in tail)} позиций (кратко):</b>")
                 for gname, entries in tail:
-                    for art, s, kind in sorted(entries, key=lambda x: -x[1]["d_min"]):
+                    for key, s, kind in sorted(entries, key=lambda x: -x[1]["d_min"]):
                         lines.append(f"• {esc(gname)} — {esc(s['brand'])} {s['price']} ₽ "
                                      f"(+{s['d_min']}% к мин. {s['min']} ₽)")
-                        sent_arts.add(art)
+                        sent_keys.add(key)
                 lines.append("")
         if recovered:
             lines.append(f"✅ <b>Вернулись в рынок: {len(recovered)}</b>")
-            for art, s in recovered:
+            for key, s in recovered:
                 lines.append(f"• {esc(s['group'])} — {esc(s['brand'])} {s['price']} ₽ "
                              f"(мин. {s['min']} ₽, {s['d_min']:+}%)")
-                sent_arts.add(art)
+                sent_keys.add(key)
             lines.append("")
         lines.append(f"<a href=\"https://docs.google.com/spreadsheets/d/{a.sheet_id}/edit\">"
                      f"Таблица цен</a>")
@@ -417,7 +421,7 @@ def main():
             print(text)
         elif not tg_token or not targets:
             print("ВНИМАНИЕ: нет TELEGRAM_BOT_TOKEN или получателей — сообщение не отправлено")
-            sent_arts = set()
+            sent_keys = set()
         else:
             chunks, buf = [], ""      # лимит Telegram — 4096 символов на сообщение
             for block in text.split("\n\n"):
@@ -429,7 +433,7 @@ def main():
                 chunks.append(buf)
             for c in [c for c in chunks if c.strip()]:
                 if not tg_send(tg_token, targets, c):
-                    sent_arts = set()   # не отмечаем как отправленное — повторим в следующий час
+                    sent_keys = set()   # не отмечаем как отправленное — повторим в следующий час
                     break
     else:
         print("новых сигналов нет — сообщение не отправлено")
@@ -440,9 +444,10 @@ def main():
 
     order = sorted(cur.items(), key=lambda kv: (kv[1]["group"], kv[1]["brand"]))
     out = []
-    for art, s in order:
-        was = prev.get(art, {})
-        pts = s["d_min"] if art in sent_arts else was.get("пункты")
+    for key, s in order:
+        art = key[0]
+        was = prev.get(key, {})
+        pts = s["d_min"] if key in sent_keys else was.get("пункты")
         if s["status"] != "дороже":
             pts = ""
         out.append([art, s["group"], s["brand"], s["price"] or "", s["min_who"],

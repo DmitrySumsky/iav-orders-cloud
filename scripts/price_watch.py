@@ -31,23 +31,30 @@ MSK = timezone(timedelta(hours=3))
 COLS = ["Артикул", "Товар (группа)", "Бренд", "Наша цена", "Мин. конкурент",
         "Цена мин.", "% к мин.", "Медиана", "% к медиане", "Дешевле нас",
         "Статус", "Обновлено", "% при уведомлении"]
-DEFAULTS = {"Порог, %": "1", "Получатели TG": "", "Часы работы (МСК)": "0-23",
+DEFAULTS = {"Порог, %": "5", "Получатели TG": "", "Часы работы (МСК)": "0-23",
             "Включён": "да", "Наши бренды": "NATURI, SUNSHINE, Health Form, 4ME, VEXOR, ORZAX"}
-# повторное уведомление по той же позиции — только если отставание выросло на столько п.п.
+# повторное уведомление по той же позиции — только если разрыв вырос на столько п.п.
 REALERT_STEP = 3.0
-# «вернулись в рынок» засчитывается только когда мы уже не дороже минимума (гистерезис)
-HYST_EXIT = 0.0
+# Гистерезис: вход в сигнал по порогу, выход — когда разрыв ужался до половины
+# порога. Симметричная петля шириной в половину порога; на нуле выходить нельзя —
+# при пороге 5% это давало бы «липкую» зону в 5 п.п., позиция висела бы в сигнале
+# годами. Ширина петли считается от порога, поэтому его правка не ломает логику.
+HYST_FRAC = 0.5
 # сколько товарных групп разбирать подробно, остальные — одной строкой
 DETAIL_GROUPS = 12
 
-# порядок строк в листе: самое горячее наверх
-RANK = {"дороже": 0, "ок": 1, "нет конкурентов": 2, "нет цены": 3}
+# порядок строк в листе: самое горячее наверх. «Дороже» — риск потерять продажи,
+# «дешевле» — недобранная маржа; первое срочнее, поэтому идёт выше
+RANK = {"дороже": 0, "дешевле": 1, "ок": 2, "нет конкурентов": 3, "нет цены": 4}
 # ширины колонок листа (px), под COLS; последняя (тех. поле) прячется
 WIDTHS = [95, 300, 105, 90, 165, 90, 85, 90, 105, 100, 105, 105, 120]
-# заливка строки по величине отставания от минимума конкурента: чем краснее,
-# тем срочнее. Границы в %, цвета — стандартная красная шкала Google Sheets
-BANDS = [(15.0, "#E06666", True), (8.0, "#EA9999", False),
-         (3.0, "#F4CCCC", False), (0.0, "#FCE8E6", False)]
+# Заливка строки по разрыву с минимумом конкурента. Красная шкала — мы дороже
+# (чем краснее, тем срочнее), зелёная — мы дешевле всех с большим отрывом
+# (можно поднять цену и остаться самыми дешёвыми). Границы в %.
+BANDS_UP = [(15.0, "#E06666", True), (8.0, "#EA9999", False),
+            (3.0, "#F4CCCC", False), (0.0, "#FCE8E6", False)]
+BANDS_DOWN = [(20.0, "#93C47D", True), (12.0, "#B6D7A8", False),
+              (0.0, "#D9EAD3", False)]
 WHITE, GRAY = "#FFFFFF", "#EFEFEF"
 
 esc = lambda s: html.escape(str(s), quote=True)
@@ -60,13 +67,19 @@ def rgb(hexstr):
 
 
 def row_style(row):
-    """Цвет и жирность строки листа по её статусу и отставанию."""
+    """Цвет и жирность строки листа по её статусу и разрыву с минимумом."""
     status, d_min = row[10], row[6]
-    if status == "дороже" and isinstance(d_min, (int, float)):
-        for edge, color, bold in BANDS:
-            if d_min >= edge:
-                return color, bold
-        return BANDS[-1][1], False
+    if isinstance(d_min, (int, float)):
+        if status == "дороже":
+            for edge, color, bold in BANDS_UP:
+                if d_min >= edge:
+                    return color, bold
+            return BANDS_UP[-1][1], False
+        if status == "дешевле":
+            for edge, color, bold in BANDS_DOWN:
+                if -d_min >= edge:
+                    return color, bold
+            return BANDS_DOWN[-1][1], False
     if status in ("нет цены", "нет конкурентов"):
         return GRAY, False
     return WHITE, False
@@ -288,7 +301,8 @@ def ensure_monitor(sheet_id, tok, sheets, tg_default):
         # строки шапки пишем на всю ширину: иначе остатки прошлой (сбойной) шапки
         # переживут перезапись, потому что values.update трогает только переданные ячейки
         rows = [["Настройки мониторинга цен", "",
-                 "порог — на сколько % мы должны быть дороже, чтобы это считалось сигналом"]
+                 "порог работает в обе стороны: на столько % дороже минимума конкурентов "
+                 "(теряем продажи) или дешевле его же (отдаём маржу)"]
                 + [""] * (len(COLS) - 3)]
         rows += [[k, v] + [""] * (len(COLS) - 2) for k, v in d.items()]
         while len(rows) < HEAD_ROW - 1:      # заголовки обязаны попасть ровно в HEAD_ROW
@@ -389,7 +403,7 @@ def main():
     book = meta["properties"]["title"]
 
     gid, cfg, prev = ensure_monitor(a.sheet_id, tok, sheets, K.get("PRICE_WATCH_TG_CHATS", ""))
-    thr_pct = as_num(cfg["Порог, %"]) or 1.0
+    thr_pct = as_num(cfg["Порог, %"]) or 5.0
     ours = {b.strip().lower() for b in cfg["Наши бренды"].split(",") if b.strip()}
     print(f"{book}: порог {thr_pct}%, наши бренды {sorted(ours)}, окно {cfg['Часы работы (МСК)']}")
     if cfg["Включён"].strip().lower() not in ("да", "yes", "1", "true"):
@@ -448,76 +462,103 @@ def main():
             key = (i["art"], g)
             was = prev.get(key, {})
             was_st, was_pts = was.get("статус", ""), was.get("пункты")
-            # «уже уведомляли» = не просто статус в листе, а записанные п.п. отставания:
+            # «уже уведомляли» = не просто статус в листе, а записанные п.п. разрыва:
             # если отправка в TG упала, пункты не проставились и сигнал повторится
-            notified = was_st == "дороже" and was_pts is not None
+            notified = was_st in ("дороже", "дешевле") and was_pts is not None
 
             if st["price"] and comp:
-                # Гистерезис. Цены WB дёргаются на доли процента, и позиция, стоящая
-                # ровно на пороге, иначе мигала бы «дороже»/«вернулись» каждый час
-                # (поймано на двух прогонах с разницей в 5 минут). Поэтому вход в
-                # сигнал — по порогу, а выход — только когда мы уже не дороже вовсе.
-                st["status"] = ("дороже" if st["d_min"] > HYST_EXIT else "ок") if notified \
-                    else ("дороже" if st["d_min"] > thr_pct else "ок")
+                # Сигнал в обе стороны: дороже минимума конкурентов = теряем продажи,
+                # дешевле минимума = отдаём маржу (можно поднять цену и всё равно
+                # остаться самыми дешёвыми). Гистерезис: цены WB дёргаются на доли
+                # процента, и позиция ровно на пороге иначе мигала бы каждый час
+                # (поймано на двух прогонах с разницей в 5 минут) — поэтому вход в
+                # сигнал по порогу, а выход только при возврате к минимуму.
+                if notified:
+                    exit_at = thr_pct * HYST_FRAC
+                    still = (st["d_min"] > exit_at) if was_st == "дороже" \
+                        else (st["d_min"] < -exit_at)
+                    st["status"] = was_st if still else "ок"
+                elif st["d_min"] > thr_pct:
+                    st["status"] = "дороже"
+                elif st["d_min"] < -thr_pct:
+                    st["status"] = "дешевле"
+                else:
+                    st["status"] = "ок"
             elif st["price"]:
                 st["status"] = "нет конкурентов"
             cur[key] = st
 
-            if st["status"] == "дороже":
-                grew = was_pts is not None and st["d_min"] >= was_pts + REALERT_STEP
+            if st["status"] in ("дороже", "дешевле"):
+                # «хуже» — это дальше от рынка в свою сторону
+                grew = was_pts is not None and (
+                    st["d_min"] >= was_pts + REALERT_STEP if st["status"] == "дороже"
+                    else st["d_min"] <= was_pts - REALERT_STEP)
                 if a.force or not notified or grew:
                     alerts.append((key, st, "рост" if (grew and notified) else "новое"))
             elif st["status"] == "ок" and notified:
-                recovered.append((key, st))
+                recovered.append((key, st, was_st))
 
     now_s = f"{datetime.now(MSK):%d.%m %H:%M}"
     total_over = sum(1 for s in cur.values() if s["status"] == "дороже")
+    total_under = sum(1 for s in cur.values() if s["status"] == "дешевле")
     print(f"позиций наших: {len(cur)}, дороже минимума на >{thr_pct}%: {total_over}, "
-          f"новых сигналов: {len(alerts)}, вернулись в рынок: {len(recovered)}")
+          f"дешевле на >{thr_pct}%: {total_under}, новых сигналов: {len(alerts)}, "
+          f"вернулись к рынку: {len(recovered)}")
 
     # ----- сообщение -----
     sent_keys = set()
     if alerts or recovered:
-        # одна наша группа = один блок: в группе до 4 наших брендов, и повторять
-        # для каждого «мин. конкурент / медиана» — это то же самое четыре раза
-        by_group = {}
-        for key, s, kind in alerts:
-            by_group.setdefault(s["group"], []).append((key, s, kind))
-        ordered = sorted(by_group.items(), key=lambda kv: -max(x[1]["d_min"] for x in kv[1]))
+        lines = []
 
-        lines = [f"⚠️ <b>Мы дороже конкурентов</b> — {now_s} МСК" if alerts
-                 else f"✅ <b>Цены</b> — {now_s} МСК"]
-        if alerts:
-            lines.append(f"Новых сигналов: {len(alerts)} по {len(ordered)} товарам "
-                         f"(сейчас дороже: {total_over} из {len(cur)})")
+        def section(head, entries_list, sign):
+            """Блок сообщения. sign=+1 — мы дороже, -1 — мы дешевле; знак задаёт
+            и порядок: сначала самый большой разрыв в свою сторону."""
+            if not entries_list:
+                return
+            by_group = {}
+            for key, s, kind in entries_list:
+                by_group.setdefault(s["group"], []).append((key, s, kind))
+            ordered = sorted(by_group.items(),
+                             key=lambda kv: -max(sign * x[1]["d_min"] for x in kv[1]))
+            lines.append(head.format(n=len(entries_list), g=len(ordered)))
             lines.append("")
             for gname, entries in ordered[:DETAIL_GROUPS]:
                 s0 = entries[0][1]
                 lines.append(f"<b>{esc(gname)}</b>")
                 lines.append(f"мин. {esc(s0['min_who'])} {s0['min']} ₽ · медиана {s0['med']} ₽ · "
                              f"конкурентов {s0.get('comp_n', 0)}")
-                for key, s, kind in sorted(entries, key=lambda x: -x[1]["d_min"]):
+                for key, s, kind in sorted(entries, key=lambda x: -sign * x[1]["d_min"]):
                     mark = "📈 " if kind == "рост" else ""
-                    flag = " ‼️ дороже всех" if s["top"] else ""
+                    flag = " ‼️ дороже всех" if (sign > 0 and s["top"]) else ""
                     url = f"https://www.wildberries.ru/catalog/{key[0]}/detail.aspx"
                     lines.append(f"{mark}• <a href=\"{url}\">{esc(s['brand'])}</a> {s['price']} ₽ — "
-                                 f"+{s['d_min']}% к мин., {s['d_med']:+}% к медиане{flag}")
+                                 f"{s['d_min']:+}% к мин., {s['d_med']:+}% к медиане{flag}")
                     sent_keys.add(key)
                 lines.append("")
             tail = ordered[DETAIL_GROUPS:]
             if tail:
                 lines.append(f"<b>Ещё {sum(len(e) for _, e in tail)} позиций (кратко):</b>")
                 for gname, entries in tail:
-                    for key, s, kind in sorted(entries, key=lambda x: -x[1]["d_min"]):
+                    for key, s, kind in sorted(entries, key=lambda x: -sign * x[1]["d_min"]):
                         lines.append(f"• {esc(gname)} — {esc(s['brand'])} {s['price']} ₽ "
-                                     f"(+{s['d_min']}% к мин. {s['min']} ₽)")
+                                     f"({s['d_min']:+}% к мин. {s['min']} ₽)")
                         sent_keys.add(key)
                 lines.append("")
+
+        up = [x for x in alerts if x[1]["status"] == "дороже"]
+        down = [x for x in alerts if x[1]["status"] == "дешевле"]
+        lines.append(f"📊 <b>Цены — {now_s} МСК</b>")
+        lines.append(f"дороже конкурентов: {total_over} из {len(cur)} · "
+                     f"дешевле рынка: {total_under} · порог {thr_pct}%")
+        lines.append("")
+        section("⚠️ <b>СТАЛИ ДОРОЖЕ</b> — {n} позиций по {g} товарам", up, 1)
+        section("💰 <b>СИЛЬНО ДЕШЕВЛЕ ВСЕХ</b> — {n} позиций по {g} товарам, "
+                "можно поднять цену", down, -1)
         if recovered:
-            lines.append(f"✅ <b>Вернулись в рынок: {len(recovered)}</b>")
-            for key, s in recovered:
+            lines.append(f"✅ <b>Вернулись к рынку: {len(recovered)}</b>")
+            for key, s, was_st in recovered:
                 lines.append(f"• {esc(s['group'])} — {esc(s['brand'])} {s['price']} ₽ "
-                             f"(мин. {s['min']} ₽, {s['d_min']:+}%)")
+                             f"(было «{was_st}», сейчас {s['d_min']:+}% к мин. {s['min']} ₽)")
                 sent_keys.add(key)
             lines.append("")
         lines.append(f"<a href=\"https://docs.google.com/spreadsheets/d/{a.sheet_id}/edit\">"
@@ -551,19 +592,25 @@ def main():
     if a.dry_run:
         print("dry-run: лист не изменён"); print("DONE"); return
 
-    # Порядок = приоритет: сначала где мы дороже всего, потом «ок» (ближайшие к
-    # порогу выше), в конце — строки без сравнения. Лист читают сверху вниз и
-    # обычно только верх, поэтому сортировка тут важнее алфавита.
-    order = sorted(cur.items(), key=lambda kv: (
-        RANK.get(kv[1]["status"], 9),
-        -(kv[1]["d_min"] if kv[1]["d_min"] is not None else -999),
-        kv[1]["group"], kv[1]["brand"]))
+    # Порядок = приоритет: сначала где мы дороже всего (риск потерять продажи),
+    # следом где мы сильнее всего дешевле рынка (недобранная маржа), потом «ок»
+    # (ближайшие к порогу выше), в конце — строки без сравнения. Лист читают
+    # сверху вниз и обычно только верх, поэтому сортировка тут важнее алфавита.
+    def sort_key(kv):
+        s = kv[1]
+        d = s["d_min"] if s["d_min"] is not None else -999
+        # внутри «дешевле» первым идёт самый большой отрыв вниз, то есть самый
+        # маленький d_min — поэтому знак второго ключа зависит от статуса
+        return (RANK.get(s["status"], 9), d if s["status"] == "дешевле" else -d,
+                s["group"], s["brand"])
+
+    order = sorted(cur.items(), key=sort_key)
     out = []
     for key, s in order:
         art = key[0]
         was = prev.get(key, {})
         pts = s["d_min"] if key in sent_keys else was.get("пункты")
-        if s["status"] != "дороже":
+        if s["status"] not in ("дороже", "дешевле"):
             pts = ""
         out.append([art, s["group"], s["brand"], s["price"] or "", s["min_who"],
                     s["min"] if s["min"] is not None else "",
@@ -577,8 +624,9 @@ def main():
     no_price = sum(1 for s in cur.values() if s["status"] == "нет цены")
     summary = (f"дороже конкурентов: {total_over} из {len(cur)}"
                + (f" · дороже ВСЕХ в группе: {top_n}" if top_n else "")
+               + f" · сильно дешевле рынка: {total_under}"
                + (f" · без цены (нет в наличии): {no_price}" if no_price else "")
-               + f" · обновлено {now_s} МСК")
+               + f" · порог {thr_pct}% · обновлено {now_s} МСК")
 
     need_rows = FIRST_DATA_ROW + len(out) + 20
     last = col_letter(len(COLS) - 1)

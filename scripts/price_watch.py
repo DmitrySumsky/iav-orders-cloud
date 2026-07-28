@@ -272,13 +272,22 @@ def find_sheet(sheet_id, tok, title):
                  if s["properties"]["title"] == title), None)
 
 
-def ensure_monitor(sheet_id, tok, sheets, tg_default):
-    """Лист «Мониторинг цен»: создать/дозаполнить шапку, вернуть (gid, настройки, состояние).
+def ensure_monitor(sheet_id, tok, sheets, tg_default, dry=False):
+    """Лист «Мониторинг цен»: создать/переложить шапку, вернуть (gid, настройки, состояние).
 
     Идемпотентно: addSheet мог пройти на сервере, а ответ — потеряться в сети,
     тогда ретрай вернёт 400 «already exists» — это не ошибка, лист просто есть.
+
+    При dry=True лист НЕ трогается вообще. Иначе «сухой» прогон перекладывал
+    раскладку (очистка + запись блока), а данные не писал, потому что выходил
+    раньше — и состояние обнулялось, а следующий боевой прогон слал всю базу
+    заново как новые сигналы. Поймано в бою 28.07.2026.
     """
     props = next((p for p in sheets if p["title"] == MON_TITLE), None)
+    if not props and dry:
+        print(f"  dry-run: листа «{MON_TITLE}» нет, работаю на дефолтных настройках")
+        d = dict(DEFAULTS); d["Получатели TG"] = tg_default
+        return None, d, {}
     if not props:
         print(f"Лист «{MON_TITLE}» не найден — создаю")
         try:
@@ -325,7 +334,9 @@ def ensure_monitor(sheet_id, tok, sheets, tg_default):
                 state[(art, grp)] = {"статус": (row[10].strip() if len(row) > 10 else ""),
                                      "пункты": as_num(row[12]) if len(row) > 12 else None}
 
-    if old_head != HEAD_ROW:
+    if old_head != HEAD_ROW and dry:
+        print(f"  dry-run: раскладку не трогаю (шапка в строке {old_head or '—'})")
+    elif old_head != HEAD_ROW:
         # Перекладываем верх листа: настройки записываем ТЕКУЩИМИ значениями
         # (иначе правки пользователя сбросятся на дефолты), состояние уже прочитано
         # выше, а данные всё равно переписываются каждый прогон.
@@ -425,7 +436,8 @@ def main():
     sheets = sorted((s["properties"] for s in meta["sheets"]), key=lambda p: p.get("index", 0))
     book = meta["properties"]["title"]
 
-    gid, cfg, prev = ensure_monitor(a.sheet_id, tok, sheets, K.get("PRICE_WATCH_TG_CHATS", ""))
+    gid, cfg, prev = ensure_monitor(a.sheet_id, tok, sheets,
+                                    K.get("PRICE_WATCH_TG_CHATS", ""), dry=a.dry_run)
     thr_pct = as_num(cfg["Порог, %"]) or 5.0
     ours = {b.strip().lower() for b in cfg["Наши бренды"].split(",") if b.strip()}
     default_targets = parse_targets(cfg["Получатели TG"])

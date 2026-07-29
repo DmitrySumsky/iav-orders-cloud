@@ -455,6 +455,19 @@ def main():
     a = ap.parse_args()
 
     K = load_keys(a.keys)
+    # Адреса брендов живут в «Настройках» пункта управления и перекрывают ключи.
+    # Утренний отчёт их читает, а монитор раньше — нет: правка чата в таблице
+    # переводила отчёт и НЕ переводила сигналы по ценам, и это было не видно.
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from control_panel import load_settings
+        ov = load_settings(a.sa, K)
+        if ov:
+            K.update(ov)
+            print(f"пункт управления: перекрыто настроек {len(ov)}")
+    except Exception as e:
+        print(f"пункт управления недоступен ({type(e).__name__}: {str(e)[:60]}) — "
+              "работаю на значениях из ключей")
     tg_token = K.get("TELEGRAM_BOT_TOKEN", "")
     say("авторизация Google…")
     tok = token_of(a.sa)

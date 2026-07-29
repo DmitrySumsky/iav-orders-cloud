@@ -30,7 +30,8 @@ COLS = ["Артикул", "Товар (группа)", "Бренд", "Наша �
         "Статус", "Обновлено", "% при уведомлении"]
 DEFAULTS = {"Порог, %": "5", "Получатели TG": "", "Часы работы (МСК)": "0-23",
             "Включён": "да", "Наши бренды": "NATURI, SUNSHINE, Health Form, 4ME, VEXOR, ORZAX",
-            "Разбивать по брендам": "нет", "Чаты по брендам": ""}
+            "Разбивать по брендам": "нет", "Чаты по брендам": "",
+            "Тест: всё в чат": ""}
 # Раскладка листа СЧИТАЕТСЯ от числа настроек, а не забита числами: иначе новая
 # строка настроек молча наезжает на строку «Сейчас» и затирает её значение.
 # 1 — заголовок, 2..N+1 — настройки, N+2 — пусто, N+3 — «Сейчас», N+4 — шапка.
@@ -39,7 +40,10 @@ HEAD_ROW = len(DEFAULTS) + 4
 FIRST_DATA_ROW = HEAD_ROW + 1
 NOTE = ("порог работает в обе стороны: на столько % дороже минимума конкурентов "
         "(теряем продажи) или дешевле его же (отдаём маржу). «Чаты по брендам»: "
-        "NATURI=-100…:5, SUNSHINE=-100…:7 — пусто = берётся из ключей отчёта")
+        "NATURI=-100…:5, SUNSHINE=-100…:7 — пусто = берётся из ключей отчёта. "
+        "«Тест: всё в чат» — репетиция рассылки: разбивка по брендам включается "
+        "принудительно, но все сообщения уходят в указанный чат с пометкой, куда "
+        "они пойдут в бою; состояние при этом не помечается")
 # повторное уведомление по той же позиции — только если разрыв вырос на столько п.п.
 REALERT_STEP = 3.0
 # Гистерезис: вход в сигнал по порогу, выход — когда разрыв ужался до половины
@@ -442,6 +446,12 @@ def main():
     ours = {b.strip().lower() for b in cfg["Наши бренды"].split(",") if b.strip()}
     default_targets = parse_targets(cfg["Получатели TG"])
     split_brands = cfg["Разбивать по брендам"].strip().lower() in ("да", "yes", "1", "true")
+    # Репетиция перед боевой рассылкой: разбивка считается включённой, но всё
+    # уходит в один тестовый чат с пометкой, куда сообщение пойдёт в бою.
+    # Состояние не помечается — после теста боевой прогон шлёт всё как в первый раз.
+    test_targets = parse_targets(cfg["Тест: всё в чат"])
+    if test_targets:
+        split_brands = True
     # «Чаты по брендам»: NATURI=-100123:5, SUNSHINE=-100123:7 — перекрывает api_keys
     route_map = {}
     for part in cfg["Чаты по брендам"].split(","):
@@ -450,7 +460,8 @@ def main():
             if b.strip() and dst.strip():
                 route_map[b.strip().lower()] = parse_targets(dst)
     print(f"рассылка: {'по брендам' if split_brands else 'общая'}"
-          + (f", переопределений в листе {len(route_map)}" if route_map else ""))
+          + (f", переопределений в листе {len(route_map)}" if route_map else "")
+          + (f", ТЕСТ: всё в {cfg['Тест: всё в чат'].strip()}" if test_targets else ""))
     print(f"{book}: порог {thr_pct}%, наши бренды {sorted(ours)}, окно {cfg['Часы работы (МСК)']}")
     if cfg["Включён"].strip().lower() not in ("да", "yes", "1", "true"):
         print("Мониторинг выключен в настройках листа"); print("DONE"); return
@@ -646,19 +657,31 @@ def main():
     if alerts or recovered:
         # раскладываем сигналы по адресатам: у каждого чата своё сообщение и
         # свои счётчики, чтобы бренду не прилетала чужая статистика
+        # ключ маршрута — адресат; в тестовом режиме адресат у всех один, поэтому
+        # группируем по бренду, иначе репетиция слепила бы всё в одно сообщение
+        def route_key(brand):
+            return brand.strip() if test_targets else tuple(targets_for(brand))
+
         routes = {}
         for item in alerts:
-            routes.setdefault(tuple(targets_for(item[1]["brand"])),
-                              {"a": [], "r": []})["a"].append(item)
+            routes.setdefault(route_key(item[1]["brand"]), {"a": [], "r": []})["a"].append(item)
         for item in recovered:
-            routes.setdefault(tuple(targets_for(item[1]["brand"])),
-                              {"a": [], "r": []})["r"].append(item)
+            routes.setdefault(route_key(item[1]["brand"]), {"a": [], "r": []})["r"].append(item)
 
-        for targets, data in routes.items():
+        def addr(t):
+            return ", ".join(c + (":" + th if th else "") for c, th in t) or "—"
+
+        for key, data in routes.items():
             brands_here = {s["brand"] for _, s, *_ in data["a"] + data["r"]}
             scope = [s for s in cur.values() if s["brand"] in brands_here]
             text, keys = build_message(data["a"], data["r"], scope)
-            who = ", ".join(c + (":" + t if t else "") for c, t in targets) or "—"
+            if test_targets:
+                targets, real = list(test_targets), targets_for(key)
+                text = (f"🧪 <b>ТЕСТ рассылки.</b> Бренд <b>{html.escape(key)}</b>, "
+                        f"в бою уйдёт в <code>{addr(real)}</code>\n\n" + text)
+            else:
+                targets = list(key)
+            who = addr(targets)
             if a.dry_run:
                 print(f"\n----- сообщение для {who} (dry-run, не отправлено) -----")
                 print(text)
@@ -666,7 +689,9 @@ def main():
             if not tg_token or not targets:
                 print(f"ВНИМАНИЕ: некуда слать ({who}) — сообщение пропущено")
                 continue
-            if send_chunked(list(targets), text):
+            if send_chunked(list(targets), text) and not test_targets:
+                # в тесте состояние не помечаем: боевая рассылка должна уйти
+                # как первая, а не «вы это уже видели»
                 sent_keys |= keys      # иначе не помечаем: повторим в следующий прогон
     else:
         print("новых сигналов нет — сообщения не отправлялись")

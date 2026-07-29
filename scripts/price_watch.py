@@ -28,10 +28,12 @@ MSK = timezone(timedelta(hours=3))
 COLS = ["Артикул", "Товар (группа)", "Бренд", "Наша цена", "Мин. конкурент",
         "Цена мин.", "% к мин.", "Медиана", "% к медиане", "Дешевле нас",
         "Статус", "Обновлено", "% при уведомлении"]
-DEFAULTS = {"Порог, %": "5", "Получатели TG": "", "Часы работы (МСК)": "0-23",
+DEFAULTS = {"Порог, %": "5", "Получатели TG": "", "Часы работы (МСК)": "8-17",
+            "Дни недели": "пн-пт", "Срочный порог, %": "",
             "Включён": "да", "Наши бренды": "NATURI, SUNSHINE, Health Form, 4ME, VEXOR, ORZAX",
             "Разбивать по брендам": "нет", "Чаты по брендам": "",
             "Тест: всё в чат": ""}
+DAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
 # Раскладка листа СЧИТАЕТСЯ от числа настроек, а не забита числами: иначе новая
 # строка настроек молча наезжает на строку «Сейчас» и затирает её значение.
 # 1 — заголовок, 2..N+1 — настройки, N+2 — пусто, N+3 — «Сейчас», N+4 — шапка.
@@ -39,7 +41,10 @@ SUMMARY_ROW = len(DEFAULTS) + 3
 HEAD_ROW = len(DEFAULTS) + 4
 FIRST_DATA_ROW = HEAD_ROW + 1
 NOTE = ("порог работает в обе стороны: на столько % дороже минимума конкурентов "
-        "(теряем продажи) или дешевле его же (отдаём маржу). «Чаты по брендам»: "
+        "(теряем продажи) или дешевле его же (отдаём маржу). «Дни недели»: пн-пт, "
+        "пн-вс или список через запятую. «Срочный порог, %»: пусто = вне рабочего "
+        "окна молчим; заполнено = и ночью, и в выходной придёт то, где разрыв "
+        "дорос до этого значения. «Чаты по брендам»: "
         "NATURI=-100…:5, SUNSHINE=-100…:7 — пусто = берётся из ключей отчёта. "
         "«Тест: всё в чат» — репетиция рассылки: разбивка по брендам включается "
         "принудительно, но все сообщения уходят в указанный чат с пометкой, куда "
@@ -379,13 +384,31 @@ def ensure_monitor(sheet_id, tok, sheets, tg_default, dry=False):
     return props["sheetId"], cfg, state
 
 
-def in_window(cfg):
+def in_hours(cfg):
     m = re.match(r"\s*(\d{1,2})\s*[-–]\s*(\d{1,2})\s*$", cfg.get("Часы работы (МСК)", ""))
     if not m:
         return True
     lo, hi = int(m.group(1)), int(m.group(2))
     h = datetime.now(MSK).hour
     return lo <= h <= hi if lo <= hi else (h >= lo or h <= hi)
+
+
+def in_days(cfg):
+    """«пн-пт», «пн-вс»/«все», либо перечисление «пн,вт,сб». Пусто = все дни.
+
+    Крон в GitHub ходит все семь дней — выходные включаются правкой ОДНОЙ ячейки
+    в листе, без деплоя. Лишние прогоны выходят на этой проверке за секунды.
+    """
+    raw = cfg.get("Дни недели", "").strip().lower()
+    if not raw or raw in ("все", "всегда", "пн-вс", "любые"):
+        return True
+    wd = datetime.now(MSK).weekday()          # 0 = понедельник
+    m = re.match(r"([а-я]{2})\s*[-–]\s*([а-я]{2})\s*$", raw)
+    if m and m.group(1) in DAYS and m.group(2) in DAYS:
+        lo, hi = DAYS.index(m.group(1)), DAYS.index(m.group(2))
+        return lo <= wd <= hi if lo <= hi else (wd >= lo or wd <= hi)
+    named = {p.strip() for p in raw.replace(";", ",").split(",")} & set(DAYS)
+    return DAYS[wd] in named if named else True
 
 
 def tg_send(tok, targets, text):
@@ -465,9 +488,19 @@ def main():
     print(f"{book}: порог {thr_pct}%, наши бренды {sorted(ours)}, окно {cfg['Часы работы (МСК)']}")
     if cfg["Включён"].strip().lower() not in ("да", "yes", "1", "true"):
         print("Мониторинг выключен в настройках листа"); print("DONE"); return
-    if not a.dry_run and not a.force and not in_window(cfg):
-        print(f"Сейчас {datetime.now(MSK):%H:%M} МСК — вне рабочего окна, прогон пропущен")
-        print("DONE"); return
+    # Вне рабочего окна по умолчанию молчим. Заполненный «Срочный порог, %»
+    # оставляет форточку: придёт только то, где разрыв дорос до этого значения.
+    urgent_pct = as_num(cfg["Срочный порог, %"]) or 0
+    urgent_only = False
+    if not a.dry_run and not a.force and not (in_hours(cfg) and in_days(cfg)):
+        when = (f"{datetime.now(MSK):%a %H:%M} МСК, окно "
+                f"{cfg['Дни недели']} {cfg['Часы работы (МСК)']}")
+        if urgent_pct <= 0:
+            print(f"Сейчас {when} — вне рабочего окна, прогон пропущен")
+            print("DONE"); return
+        urgent_only = True
+        print(f"Сейчас {when} — вне окна, но задан срочный порог {urgent_pct}%: "
+              "шлём только резкие отрывы")
 
     # ----- товарные группы с первого листа книги (WB) -----
     wb_title = sheets[0]["title"]
@@ -550,10 +583,18 @@ def main():
                 grew = was_pts is not None and (
                     st["d_min"] >= was_pts + REALERT_STEP if st["status"] == "дороже"
                     else st["d_min"] <= was_pts - REALERT_STEP)
-                if a.force or not notified or grew:
+                if (a.force or not notified or grew) and \
+                        (not urgent_only or abs(st["d_min"]) >= urgent_pct):
                     alerts.append((key, st, "рост" if (grew and notified) else "новое"))
             elif st["status"] == "ок" and notified:
-                recovered.append((key, st, was_st))
+                if urgent_only:
+                    # Срочный прогон только ДОБАВЛЯЕТ сигналы, закрывать их он не
+                    # вправе: иначе «вернулись к рынку» тихо съедалось бы ночью.
+                    # Оставляем позицию в прежнем статусе — утренний прогон в окне
+                    # увидит её как незакрытую и отправит возврат.
+                    st["status"] = was_st
+                else:
+                    recovered.append((key, st, was_st))
 
     now_s = f"{datetime.now(MSK):%d.%m %H:%M}"
     total_over = sum(1 for s in cur.values() if s["status"] == "дороже")

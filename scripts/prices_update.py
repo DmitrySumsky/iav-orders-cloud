@@ -12,6 +12,14 @@
 не затирает старые значения. Конкурентов в строки добавляют руками — скрипт
 подхватывает любые новые строки.
 
+Ручные колонки людей не трогаются (правило с 30.07.2026):
+  - новые даты вставляются ПЕРЕД первой датированной колонкой, а не жёстко в D,
+    поэтому вспомогательные колонки слева от блока дат («Средняя» и т.п.) стоят
+    на месте, а не уползают вправо с каждым прогоном;
+  - пишем только в колонки, у которых в шапке разобранная дата: колонка без даты
+    внутри блока дат остаётся как есть (раньше её содержимое затиралось — живая
+    формула превращалась в замороженное число).
+
 Использование:
   python3 prices_update.py --keys api_keys.txt[,extra] --sa google_sa.json --sheet-id <ID>
 Печатает DONE при успехе.
@@ -110,6 +118,24 @@ def as_int(x):
     x = re.sub(r"[^\d]", "", str(x))
     return int(x) if x else ""
 
+def date_cols(hdr, today):
+    """{индекс колонки: iso-дата} по шапке — только там, где дата разобралась."""
+    out = {}
+    for i, v in enumerate(hdr):
+        if i >= FIRST_DATE_COL - 1 and str(v).strip():
+            iso = hdr_to_iso(str(v), today)
+            if iso: out[i] = iso
+    return out
+
+def runs_of(idxs):
+    """Подряд идущие индексы -> список (начало, конец). Нужен, чтобы писать
+    только в датированные колонки и перепрыгивать чужие."""
+    runs = []
+    for i in sorted(idxs):
+        if runs and i == runs[-1][1] + 1: runs[-1][1] = i
+        else: runs.append([i, i])
+    return [(a, b) for a, b in runs]
+
 def process_tab(sheet_id, tok, props, mp_token, mp_kind, field, workers):
     """Один лист: догнать даты + заполнить пустые. Возвращает None или ошибку."""
     title, gid = props["title"], props["sheetId"]
@@ -134,13 +160,14 @@ def process_tab(sheet_id, tok, props, mp_token, mp_kind, field, workers):
 
     hdr = api(f"{sheet_id}/values/{qurl}!A1:BZ1?valueRenderOption=FORMATTED_VALUE",
               tok).get("values", [[]])[0]
-    existing = []
-    for i, v in enumerate(hdr):
-        if i >= FIRST_DATE_COL - 1 and str(v).strip():
-            iso = hdr_to_iso(str(v), today)
-            if iso: existing.append(datetime.strptime(iso, "%Y-%m-%d").date())
+    cols0 = date_cols(hdr, today)
+    existing = [datetime.strptime(v, "%Y-%m-%d").date() for v in cols0.values()]
     newest = max(existing) if existing else (lat - timedelta(days=1))
-    print(f"[{title}] в таблице по {newest}, у MPStats по {lat}, строк {len(arts)}")
+    # вставляем ПЕРЕД первой датированной колонкой: всё, что человек завёл левее
+    # блока дат, остаётся на своём месте
+    insert_at = min(cols0) if cols0 else FIRST_DATE_COL - 1
+    print(f"[{title}] в таблице по {newest}, у MPStats по {lat}, строк {len(arts)}, "
+          f"блок дат с {col_letter(insert_at)}")
 
     missing = []
     d = lat
@@ -150,52 +177,58 @@ def process_tab(sheet_id, tok, props, mp_token, mp_kind, field, workers):
         n = len(missing)
         api(sheet_id + ":batchUpdate", tok, "POST", {"requests": [
             {"insertDimension": {"range": {"sheetId": gid, "dimension": "COLUMNS",
-                "startIndex": FIRST_DATE_COL - 1, "endIndex": FIRST_DATE_COL - 1 + n},
+                "startIndex": insert_at, "endIndex": insert_at + n},
                 "inheritFromBefore": False}}]})
-        last_new = col_letter(FIRST_DATE_COL - 1 + n - 1)
+        last_new = col_letter(insert_at + n - 1)
         api(sheet_id + "/values:batchUpdate", tok, "POST", {"valueInputOption": "USER_ENTERED",
-            "data": [{"range": f"{q}!{col_letter(FIRST_DATE_COL-1)}1:{last_new}1",
+            "data": [{"range": f"{q}!{col_letter(insert_at)}1:{last_new}1",
                       "values": [[x.strftime('%d.%m') for x in missing]]}]})
         print(f"[{title}] добавлены даты: {[x.strftime('%d.%m') for x in missing]}")
 
     # полная заливка окна дат (существующее не затирается пустотой)
     hdr = api(f"{sheet_id}/values/{qurl}!A1:BZ1?valueRenderOption=FORMATTED_VALUE",
               tok).get("values", [[]])[0]
-    col_iso = {}
-    for i, v in enumerate(hdr):
-        if i >= FIRST_DATE_COL - 1 and str(v).strip():
-            iso = hdr_to_iso(str(v), today)
-            if iso: col_iso[i] = iso
+    col_iso = date_cols(hdr, today)
     lo, hi = min(col_iso), max(col_iso)
     newest_col = max(col_iso, key=lambda c: col_iso[c])
     last = col_letter(hi)
+    # чужие колонки внутри блока дат: пишем ВОКРУГ них, содержимое не трогаем
+    runs = runs_of(col_iso)
+    alien = [col_letter(c) for c in range(lo, hi + 1) if c not in col_iso]
+    if alien:
+        print(f"[{title}] колонки без даты внутри блока дат: {', '.join(alien)} "
+              f"— не трогаем (заливка идёт {len(runs)} диапазонами)")
     data = api(f"{sheet_id}/values/{qurl}!A2:{last}5000?valueRenderOption=FORMATTED_VALUE",
                tok).get("values", [])
     todo = []
     for r, row in enumerate(data):
         art = row[1].strip() if len(row) > 1 else ""
         if not art.isdigit(): continue
-        ex_vals = [as_int(row[ci]) if len(row) > ci else "" for ci in range(lo, hi + 1)]
         need = missing or not str(row[newest_col] if len(row) > newest_col else "").strip()
-        if need: todo.append((r + 2, art, ex_vals))
+        if need: todo.append((r + 2, art, row))
     print(f"[{title}] к заливке: {len(todo)} строк")
 
     def fetch(item):
-        rownum, art, ex_vals = item
+        rownum, art, row = item
         h = mp_history(art, mp_token, mp_kind, field)
-        vals = []
-        for k, ci in enumerate(range(lo, hi + 1)):
-            iso = col_iso.get(ci)
-            v = h.get(iso) if (iso and iso in h) else ex_vals[k]
-            vals.append(v if v is not None else "")
-        return rownum, vals
+        out = []
+        for a, b in runs:
+            vals = []
+            for ci in range(a, b + 1):
+                v = h.get(col_iso[ci])
+                if v is None:  # MPStats молчит — оставляем то, что уже в таблице
+                    v = as_int(row[ci]) if len(row) > ci else ""
+                vals.append(v if v is not None else "")
+            out.append((a, b, vals))
+        return rownum, out
 
     updates, filled = [], 0
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        for rownum, vals in ex.map(fetch, todo):
-            filled += sum(1 for v in vals if v != "")
-            updates.append({"range": f"{q}!{col_letter(lo)}{rownum}:{last}{rownum}",
-                            "values": [vals]})
+        for rownum, out in ex.map(fetch, todo):
+            for a, b, vals in out:
+                filled += sum(1 for v in vals if v != "")
+                updates.append({"range": f"{q}!{col_letter(a)}{rownum}:{col_letter(b)}{rownum}",
+                                "values": [vals]})
     for i in range(0, len(updates), 60):
         api(sheet_id + "/values:batchUpdate", tok, "POST",
             {"valueInputOption": "USER_ENTERED", "data": updates[i:i + 60]})

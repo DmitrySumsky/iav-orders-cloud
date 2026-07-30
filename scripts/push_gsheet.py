@@ -88,10 +88,23 @@ TOK = json.loads(urllib.request.urlopen(urllib.request.Request(
 H = {"Authorization": f"Bearer {TOK}", "Content-Type": "application/json"}
 BASE = f"https://sheets.googleapis.com/v4/spreadsheets/{a.sheet_id}"
 
-def api(url, payload=None, method=None):
+def api(url, payload=None, method=None, tries=5):
+    # 429/5xx и сетевые сбои у Google Sheets транзиентны (разовый 503 уже ронял
+    # утренний прогон 23.07) — ретраим с backoff; прочие 4xx отдаём сразу
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data, headers=H, method=method)
-    return json.loads(urllib.request.urlopen(req, timeout=60).read())
+    for attempt in range(tries):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 500, 502, 503, 504) and attempt < tries - 1:
+                time.sleep(min(30, 3 * (2 ** attempt))); continue
+            raise
+        except (urllib.error.URLError, TimeoutError, OSError):
+            if attempt < tries - 1:
+                time.sleep(min(30, 3 * (2 ** attempt))); continue
+            raise
 
 meta = api(f"{BASE}?fields=sheets(properties(sheetId,title),conditionalFormats)")
 sheets = {s["properties"]["title"]: s for s in meta["sheets"]}

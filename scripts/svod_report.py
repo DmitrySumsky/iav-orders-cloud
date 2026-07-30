@@ -151,14 +151,24 @@ TOK = json.loads(urllib.request.urlopen(urllib.request.Request(
 H = {"Authorization": f"Bearer {TOK}", "Content-Type": "application/json"}
 BASE = f"https://sheets.googleapis.com/v4/spreadsheets/{SHEET_ID}"
 
-def api(url, payload=None, method=None):
+def api(url, payload=None, method=None, tries=5):
+    # 429/5xx и сетевые сбои у Google Sheets транзиентны — ретраим с backoff;
+    # тело ответа печатаем, иначе 400 от batchUpdate неотлаживаем
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data, headers=H, method=method)
-    try:
-        return json.loads(urllib.request.urlopen(req, timeout=60).read())
-    except urllib.error.HTTPError as e:
-        print(f"Sheets API {e.code}: {e.read().decode()[:400]}")
-        raise
+    for attempt in range(tries):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 500, 502, 503, 504) and attempt < tries - 1:
+                time.sleep(min(30, 3 * (2 ** attempt))); continue
+            print(f"Sheets API {e.code}: {e.read().decode()[:400]}")
+            raise
+        except (urllib.error.URLError, TimeoutError, OSError):
+            if attempt < tries - 1:
+                time.sleep(min(30, 3 * (2 ** attempt))); continue
+            raise
 
 def col_a1(n):
     s = ""

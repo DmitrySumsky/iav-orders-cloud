@@ -10,7 +10,7 @@ api_keys при каждом прогоне (пустое значение = н�
   CRON_TIME (ЧЧ:ММ МСК) — при изменении время в cron-job.org правится само
   (нужен CRONJOB_API_KEY и CRONJOB_JOB_ID в ключах).
 """
-import json, time, urllib.request, urllib.parse
+import json, time, urllib.request, urllib.parse, urllib.error
 from datetime import datetime, timedelta, timezone
 
 MSK = timezone(timedelta(hours=3))
@@ -52,12 +52,24 @@ def _auth(sa_file):
     return json.loads(urllib.request.urlopen(urllib.request.Request(
         "https://oauth2.googleapis.com/token", data=body), timeout=30).read())["access_token"]
 
-def _api(sheet_id, tok, path="", payload=None, method=None):
+def _api(sheet_id, tok, path="", payload=None, method=None, tries=5):
     url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}{path}"
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data, method=method,
         headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"})
-    return json.loads(urllib.request.urlopen(req, timeout=60).read())
+    # 429/5xx и сетевые сбои у Google — транзиентные, ретраим с backoff
+    for attempt in range(tries):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 500, 502, 503, 504) and attempt < tries - 1:
+                time.sleep(min(30, 3 * (2 ** attempt))); continue
+            raise
+        except (urllib.error.URLError, TimeoutError, OSError):
+            if attempt < tries - 1:
+                time.sleep(min(30, 3 * (2 ** attempt))); continue
+            raise
 
 def _ensure_sheets(sheet_id, tok):
     meta = _api(sheet_id, tok, "?fields=sheets.properties(sheetId,title)")

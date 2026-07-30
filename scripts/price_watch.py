@@ -58,6 +58,12 @@ REALERT_STEP = 3.0
 HYST_FRAC = 0.5
 # сколько товарных групп разбирать подробно, остальные — одной строкой
 DETAIL_GROUPS = 12
+# Площадка в заголовке. Монитор — WB по построению: живая цена берётся из
+# card.wb.ru, ссылки ведут на wildberries.ru, лист Ozon в сравнение не идёт
+# (там только наши SKU, конкурентов нет). Метка стоит ПЕРВОЙ строкой и первым
+# словом: в списке чатов и в пуше видно только начало, а читателю из Ozon-отдела
+# нужно понять «моё/не моё», не открывая сообщение (запрос Владимира 30.07.2026).
+MP_LABEL = "ВБ"
 
 # порядок строк в листе: самое горячее наверх. «Дороже» — риск потерять продажи,
 # «дешевле» — недобранная маржа; первое срочнее, поэтому идёт выше
@@ -631,7 +637,8 @@ def main():
         return parse_targets(raw) if raw else default_targets
 
     def build_message(part_alerts, part_recovered, scope):
-        """Текст для одного адресата + ключи, которые в него вошли."""
+        """Текст для одного адресата + ключи, которые в него вошли, + короткая
+        шапка для продолжений (длинное сообщение уходит несколькими)."""
         lines, keys = [], set()
 
         def section(head, entries_list, sign):
@@ -673,7 +680,7 @@ def main():
         head_brand = (brands[0] if len(brands) == 1 else ", ".join(brands)[:60])
         over = sum(1 for s in scope if s["status"] == "дороже")
         under = sum(1 for s in scope if s["status"] == "дешевле")
-        lines.append(f"📊 <b>{esc(head_brand)} — цены на {now_s} МСК</b>")
+        lines.append(f"📊 <b>{MP_LABEL} · {esc(head_brand)} — цены на {now_s} МСК</b>")
         lines.append(f"дороже конкурентов: {over} из {len(scope)} · "
                      f"дешевле рынка: {under} · порог {thr_pct}%")
         lines.append("")
@@ -690,10 +697,10 @@ def main():
                 keys.add(key)
             lines.append("")
         lines.append(f"<a href=\"https://docs.google.com/spreadsheets/d/{a.sheet_id}/edit\">"
-                     f"Таблица цен</a>")
-        return "\n".join(lines), keys
+                     f"Таблица цен {MP_LABEL}</a>")
+        return "\n".join(lines), keys, f"📊 <b>{MP_LABEL} · {esc(head_brand)}</b>"
 
-    def send_chunked(targets, text):
+    def send_chunked(targets, text, cont_head=""):
         chunks, buf = [], ""      # лимит Telegram — 4096 символов на сообщение
         for block in text.split("\n\n"):
             if buf and len(buf) + len(block) + 2 > 3500:
@@ -702,7 +709,13 @@ def main():
                 buf = (buf + "\n\n" + block) if buf else block
         if buf:
             chunks.append(buf)
-        for c in [c for c in chunks if c.strip()]:
+        parts = [c for c in chunks if c.strip()]
+        for n, c in enumerate(parts):
+            # Метка площадки нужна в КАЖДОМ сообщении: заголовок попадает только
+            # в первое, а в чат их приходит несколько подряд — без этого
+            # продолжение снова читается как «непонятно про что».
+            if n and cont_head:
+                c = f"{cont_head} — продолжение {n + 1}/{len(parts)}\n\n" + c
             if not tg_send(tg_token, targets, c):
                 return False
         return True
@@ -728,7 +741,7 @@ def main():
         for key, data in routes.items():
             brands_here = {s["brand"] for _, s, *_ in data["a"] + data["r"]}
             scope = [s for s in cur.values() if s["brand"] in brands_here]
-            text, keys = build_message(data["a"], data["r"], scope)
+            text, keys, cont_head = build_message(data["a"], data["r"], scope)
             if test_targets:
                 targets, real = list(test_targets), targets_for(key)
                 text = (f"🧪 <b>ТЕСТ рассылки.</b> Бренд <b>{html.escape(key)}</b>, "
@@ -743,7 +756,7 @@ def main():
             if not tg_token or not targets:
                 print(f"ВНИМАНИЕ: некуда слать ({who}) — сообщение пропущено")
                 continue
-            if send_chunked(list(targets), text) and not test_targets:
+            if send_chunked(list(targets), text, cont_head) and not test_targets:
                 # в тесте состояние не помечаем: боевая рассылка должна уйти
                 # как первая, а не «вы это уже видели»
                 sent_keys |= keys      # иначе не помечаем: повторим в следующий прогон

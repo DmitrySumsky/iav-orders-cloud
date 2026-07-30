@@ -52,6 +52,9 @@ for part in raw.split(","):
         TARGETS.append((cid, None if thr.strip() == "1" else thr))
     else:
         TARGETS.append((part, None))
+# один и тот же адрес мог прийти и общим, и брендовым (LOVE&DOVE: оба = личка
+# владельца) — иначе отчёт приходит туда дважды
+TARGETS = list(dict.fromkeys(TARGETS))
 if not TOK or not TARGETS:
     print("ERROR: нет TELEGRAM_BOT_TOKEN / получателей"); sys.exit(1)
 

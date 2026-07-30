@@ -14,7 +14,7 @@
 Использование:
   python3 history.py --brand NATURI --keys api_keys.txt --state-dir .iav-orders [--days 30]
 """
-import argparse, json, os, re, sys, time, urllib.request, urllib.error
+import argparse, json, os, re, sys, time, urllib.request, urllib.error, urllib.parse
 from datetime import date, timedelta, datetime, timezone
 
 TIME_BUDGET = int(__import__("os").environ.get("TIME_BUDGET", 33))
@@ -56,10 +56,13 @@ H = json.load(open(hist_f)) if os.path.exists(hist_f) else \
     {"data": {}, "wb_done": [], "wb_dates": [], "oz_dates": []}
 def save(): json.dump(H, open(hist_f, "w"), ensure_ascii=False)
 
-def http(url, headers=None, body=None, timeout=60, _tries=12):
+def http(url, headers=None, body=None, timeout=60, _tries=12, _net_tries=3):
     # Автоповтор при 429/5xx и сетевых сбоях: один IP GitHub упирается в
     # rate-limit WB/Ozon, когда бренды идут подряд. Ждём и повторяем.
+    # Таймаут ЧТЕНИЯ прилетает голым TimeoutError (urllib заворачивает в
+    # URLError только фазу соединения) — ловим OSError целиком.
     req = urllib.request.Request(url, data=body, headers=headers or {})
+    net_fails = 0
     for attempt in range(_tries):
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -72,10 +75,15 @@ def http(url, headers=None, body=None, timeout=60, _tries=12):
                 time.sleep(wait or min(60, 5 * (2 ** attempt)))
                 continue
             raise
-        except urllib.error.URLError:
-            if attempt < _tries - 1:
-                time.sleep(min(30, 5 * (2 ** attempt))); continue
-            raise
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            # висящий эндпоинт не должен съесть все 12 попыток по таймауту:
+            # накопленное уже в файле, выходим кодом 0 — оркестратор повторит
+            net_fails += 1
+            if net_fails >= _net_tries or attempt == _tries - 1:
+                print(f"{urllib.parse.urlsplit(url).netloc} не ответил "
+                      f"({type(e).__name__}: {e}) — перезапусти")
+                sys.exit(0)
+            time.sleep(min(30, 5 * (2 ** net_fails)))
 
 def add(art_base, day, platform, n):
     d = H["data"].setdefault(art_base, {}).setdefault(day, {"wb": 0, "oz": 0})

@@ -9,7 +9,7 @@
 Использование:
   python3 collect.py --brand NATURI --keys /path/api_keys.txt --state-dir /path/.iav-orders
 """
-import argparse, json, os, re, sys, time, urllib.request, urllib.error
+import argparse, json, os, re, sys, time, urllib.request, urllib.error, urllib.parse
 from datetime import date, timedelta, datetime, timezone
 
 TIME_BUDGET = int(__import__("os").environ.get("TIME_BUDGET", 33))
@@ -33,10 +33,17 @@ def load_keys(path):
             k, v = line.split("=", 1); d[k] = v.strip()
     return d
 
-def http(url, headers=None, body=None, timeout=60, _tries=12):
+class NetDown(Exception):
+    """Маркетплейс не ответил (таймаут/обрыв) после всех повторов.
+    Не ошибка данных: состояние сохранено, нужен просто перезапуск."""
+
+def http(url, headers=None, body=None, timeout=60, _tries=12, _net_tries=3):
     # Автоповтор при 429/5xx и сетевых сбоях: один IP GitHub упирается в
     # rate-limit WB/Ozon, когда бренды идут подряд. Ждём и повторяем.
+    # ВАЖНО: таймаут ЧТЕНИЯ прилетает голым TimeoutError — urllib заворачивает
+    # в URLError только фазу соединения. Ловим OSError целиком.
     req = urllib.request.Request(url, data=body, headers=headers or {})
+    net_fails = 0
     for attempt in range(_tries):
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -49,10 +56,14 @@ def http(url, headers=None, body=None, timeout=60, _tries=12):
                 time.sleep(wait or min(60, 5 * (2 ** attempt)))
                 continue
             raise
-        except urllib.error.URLError:
-            if attempt < _tries - 1:
-                time.sleep(min(30, 5 * (2 ** attempt))); continue
-            raise
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            # сетевые повторы считаем отдельно: висящий эндпоинт не должен
+            # съесть все 12 попыток по таймауту (это часы)
+            net_fails += 1
+            if net_fails >= _net_tries or attempt == _tries - 1:
+                raise NetDown(f"{urllib.parse.urlsplit(url).netloc} не ответил "
+                              f"({type(e).__name__}: {e})")
+            time.sleep(min(30, 5 * (2 ** net_fails)))
 
 def main():
     a = parse_args()
@@ -112,6 +123,8 @@ def main():
             try:
                 d = http("https://seller-analytics-api.wildberries.ru/api/analytics/v3/sales-funnel/products/history",
                          WB_H, body, timeout=60)
+            except NetDown as e:
+                print(f"{e} — перезапусти"); return
             except urllib.error.HTTPError as e:
                 if e.code == 429 or e.code >= 500:
                     print(f"WB {e.code} — перезапусти через минуту"); return
@@ -151,6 +164,9 @@ def main():
                 try:
                     d = http("https://seller-analytics-api.wildberries.ru/api/analytics/v3/sales-funnel/products",
                              WB_H, body, timeout=60)
+                except NetDown as e:
+                    S["wb_o14_partial"] = orders; save()
+                    print(f"{e} — перезапусти"); return
                 except urllib.error.HTTPError as e:
                     if e.code == 429 or e.code >= 500:
                         S["wb_o14_partial"] = orders; save()
@@ -301,4 +317,9 @@ def main():
     print("DONE" if wb_ok and oz_ok else "PROGRESS — перезапусти")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except NetDown as e:
+        # Ozon/WB не ответили — выходим кодом 0: собранное сохранено,
+        # оркестратор перезапустит и скрипт продолжит с того же места.
+        print(f"{e} — перезапусти")

@@ -82,14 +82,20 @@ def tg_alert(text):
     """Служебное уведомление о сбое (не валит прогон, если само упало)."""
     tg_send(K.get("TELEGRAM_CHAT_ID", ""), text)
 
-def run_until_done(args, max_runs=25):
-    """Резюмируемые скрипты печатают DONE. Между повторами пауза."""
+def run_until_done(args, max_runs=25, deadline_sec=1500):
+    """Резюмируемые скрипты печатают DONE. Между повторами пауза.
+    deadline_sec — потолок по времени: если МП висит (таймауты по минуте),
+    один бренд не должен съесть весь лимит джоба."""
+    t0 = time.time()
     for i in range(max_runs):
         r = subprocess.run(args, capture_output=True, text=True)
         out = (r.stdout + r.stderr).strip()
-        if out: print(out[-2000:], flush=True)
+        # показываем и начало вывода — по нему видно, какой шаг успел пройти
+        if out: print(out if len(out) <= 2200 else out[:600] + "\n…\n" + out[-1600:], flush=True)
         if r.returncode != 0: return False
         if "DONE" in out: return True
+        if time.time() - t0 > deadline_sec:
+            print(f"не уложились в {deadline_sec // 60} мин — сдаёмся"); return False
         time.sleep(60 if "429" in out else 25)
     return False
 

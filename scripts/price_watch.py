@@ -524,13 +524,30 @@ def main():
     # ----- товарные группы с первого листа книги (WB) -----
     wb_title = sheets[0]["title"]
     q = urllib.parse.quote("'" + wb_title.replace("'", "''") + "'")
-    rows = api(f"{a.sheet_id}/values/{q}!A2:C2000?valueRenderOption=FORMATTED_VALUE",
+    rows = api(f"{a.sheet_id}/values/{q}!A1:P2000?valueRenderOption=FORMATTED_VALUE",
                tok).get("values", [])
+    # Колонки ищем ПО ШАПКЕ, а не по буквам A/B/C: менеджеры заводят слева от дат
+    # свои колонки (в книге автохимии это «Прогрев» и «Прогрев к-во», 31.07.2026),
+    # и жёсткое «бренд = C» тихо превращает бренд в «да» — наших позиций
+    # находится ноль, а лист мониторинга обнуляется вместе с состоянием.
+    head = [str(x).strip().lower() for x in (rows[0] if rows else [])]
+
+    def col_by(words, default):
+        for i, h in enumerate(head):
+            if any(w in h for w in words):
+                return i
+        return default
+
+    i_name = col_by(("название", "товар"), 0)
+    i_art = col_by(("артикул", "nmid", "sku"), 1)
+    i_brand = col_by(("бренд",), 2)
+    if (i_name, i_art, i_brand) != (0, 1, 2):
+        print(f"[{wb_title}] раскладка: название={col_letter(i_name)}, "
+              f"артикул={col_letter(i_art)}, бренд={col_letter(i_brand)}")
     items, group = [], None
-    for r in rows:
-        name = (r[0].strip() if len(r) > 0 else "")
-        art = (r[1].strip() if len(r) > 1 else "")
-        brand = (r[2].strip() if len(r) > 2 else "")
+    for r in rows[1:]:
+        cell = lambda i: (str(r[i]).strip() if len(r) > i else "")
+        name, art, brand = cell(i_name), cell(i_art), cell(i_brand)
         if name:
             group = name
         if art.isdigit():

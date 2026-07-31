@@ -18,7 +18,11 @@
     на месте, а не уползают вправо с каждым прогоном;
   - пишем только в колонки, у которых в шапке разобранная дата: колонка без даты
     внутри блока дат остаётся как есть (раньше её содержимое затиралось — живая
-    формула превращалась в замороженное число).
+    формула превращалась в замороженное число);
+  - колонка артикула ищется ПО ШАПКЕ (31.07.2026): в книге автохимии менеджер
+    завёл слева «Прогрев» и «Прогрев к-во», и всё, что считало «артикул = B»,
+    стало бы читать не ту колонку. Ручные колонки печатаются в лог каждым
+    прогоном — видно, что именно скрипт обязан сохранить.
 
 Использование:
   python3 prices_update.py --keys api_keys.txt[,extra] --sa google_sa.json --sheet-id <ID>
@@ -118,11 +122,23 @@ def as_int(x):
     x = re.sub(r"[^\d]", "", str(x))
     return int(x) if x else ""
 
-def date_cols(hdr, today):
+def col_by(hdr, words, default):
+    """Индекс колонки по слову в шапке. Раскладка ищется ПО ИМЕНАМ, а не по
+    буквам: менеджеры заводят слева от дат свои колонки («Прогрев» и
+    «Прогрев к-во» в книге автохимии, 31.07.2026), и всё, что завязано на
+    «артикул = B», после этого читает не ту колонку."""
+    for i, h in enumerate(hdr):
+        if any(w in str(h).strip().lower() for w in words):
+            return i
+    return default
+
+
+def date_cols(hdr, today, first=None):
     """{индекс колонки: iso-дата} по шапке — только там, где дата разобралась."""
+    lo = FIRST_DATE_COL - 1 if first is None else first
     out = {}
     for i, v in enumerate(hdr):
-        if i >= FIRST_DATE_COL - 1 and str(v).strip():
+        if i >= lo and str(v).strip():
             iso = hdr_to_iso(str(v), today)
             if iso: out[i] = iso
     return out
@@ -142,10 +158,13 @@ def process_tab(sheet_id, tok, props, mp_token, mp_kind, field, workers):
     q = "'" + title.replace("'", "''") + "'"; qurl = urllib.parse.quote(q)
     today = date.today()
 
-    rows = api(f"{sheet_id}/values/{qurl}!A2:C5000?valueRenderOption=FORMATTED_VALUE",
-               tok).get("values", [])
-    arts = [(r + 2, row[1].strip()) for r, row in enumerate(rows)
-            if len(row) > 1 and row[1].strip().isdigit()]
+    hdr0 = api(f"{sheet_id}/values/{qurl}!A1:BZ1?valueRenderOption=FORMATTED_VALUE",
+               tok).get("values", [[]])[0]
+    i_art = col_by(hdr0, ("артикул", "nmid", "sku"), 1)
+    rows = api(f"{sheet_id}/values/{qurl}!A2:{col_letter(i_art)}5000"
+               f"?valueRenderOption=FORMATTED_VALUE", tok).get("values", [])
+    arts = [(r + 2, row[i_art].strip()) for r, row in enumerate(rows)
+            if len(row) > i_art and row[i_art].strip().isdigit()]
     if not arts:
         print(f"[{title}] нет строк с артикулами — пропуск"); return None
 
@@ -158,16 +177,20 @@ def process_tab(sheet_id, tok, props, mp_token, mp_kind, field, workers):
         return f"[{title}] MPStats не ответил на пробы"
     lat = datetime.strptime(lat, "%Y-%m-%d").date()
 
-    hdr = api(f"{sheet_id}/values/{qurl}!A1:BZ1?valueRenderOption=FORMATTED_VALUE",
-              tok).get("values", [[]])[0]
-    cols0 = date_cols(hdr, today)
+    hdr = hdr0
+    cols0 = date_cols(hdr, today, first=i_art + 1)
     existing = [datetime.strptime(v, "%Y-%m-%d").date() for v in cols0.values()]
     newest = max(existing) if existing else (lat - timedelta(days=1))
     # вставляем ПЕРЕД первой датированной колонкой: всё, что человек завёл левее
     # блока дат, остаётся на своём месте
-    insert_at = min(cols0) if cols0 else FIRST_DATE_COL - 1
+    # Дат ещё нет — встаём сразу за последней заполненной колонкой шапки, а не
+    # жёстко в D: иначе новая дата врезалась бы в середину ручного блока.
+    tail0 = max((i for i, h in enumerate(hdr) if str(h).strip()), default=FIRST_DATE_COL - 2) + 1
+    insert_at = min(cols0) if cols0 else max(FIRST_DATE_COL - 1, i_art + 1, tail0)
+    kept = [str(h).strip() for h in hdr[:insert_at] if str(h).strip()]
     print(f"[{title}] в таблице по {newest}, у MPStats по {lat}, строк {len(arts)}, "
-          f"блок дат с {col_letter(insert_at)}")
+          f"блок дат с {col_letter(insert_at)}; ручные колонки слева "
+          f"({len(kept)}): {', '.join(kept) or '—'}")
 
     missing = []
     d = lat
@@ -188,7 +211,7 @@ def process_tab(sheet_id, tok, props, mp_token, mp_kind, field, workers):
     # полная заливка окна дат (существующее не затирается пустотой)
     hdr = api(f"{sheet_id}/values/{qurl}!A1:BZ1?valueRenderOption=FORMATTED_VALUE",
               tok).get("values", [[]])[0]
-    col_iso = date_cols(hdr, today)
+    col_iso = date_cols(hdr, today, first=i_art + 1)
     lo, hi = min(col_iso), max(col_iso)
     newest_col = max(col_iso, key=lambda c: col_iso[c])
     last = col_letter(hi)
@@ -202,7 +225,7 @@ def process_tab(sheet_id, tok, props, mp_token, mp_kind, field, workers):
                tok).get("values", [])
     todo = []
     for r, row in enumerate(data):
-        art = row[1].strip() if len(row) > 1 else ""
+        art = row[i_art].strip() if len(row) > i_art else ""
         if not art.isdigit(): continue
         need = missing or not str(row[newest_col] if len(row) > newest_col else "").strip()
         if need: todo.append((r + 2, art, row))

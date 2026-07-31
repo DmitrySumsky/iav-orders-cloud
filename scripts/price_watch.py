@@ -7,17 +7,20 @@ card.wb.ru: `sizes[0].price.product / 100` = цена карточки, цена
 за запрос, без авторизации: весь лист (321 артикул) закрывается 4 запросами.
 
 Товарная группа = значение колонки A (тянется вниз, пустая строка = разделитель).
-Внутри группы наши бренды сравниваются с конкурентами тремя способами:
-минимум / медиана / «дороже всех». Порог и получатели живут в листе
-«Мониторинг цен» этой же книги — он же хранит состояние (что уже отправлено),
-поэтому почасовые прогоны не коммитят ничего в репозиторий.
+Внутри группы наши бренды сравниваются с минимумом конкурентов и с «дороже
+всех», а якорные конкуренты показываются ПОИМЁННО отдельными колонками.
+Медианы убраны 30.07.2026 по просьбе менеджера: он берёт самого дешёвого,
+а медиана усредняет и рисует рынок дороже, чем он есть.
+Порог, состав групп А/Б и получатели живут в листе «Мониторинг цен» этой же
+книги — он же хранит состояние (что уже отправлено), поэтому почасовые
+прогоны не коммитят ничего в репозиторий.
 
 Использование:
   python3 price_watch.py --keys api_keys.txt[,extra] --sa google_sa.json \
       --sheet-id <ID> [--dry-run] [--force]
 Печатает DONE при успехе.
 """
-import argparse, html, json, math, os, re, statistics, sys, time
+import argparse, html, json, math, os, re, sys, time
 import urllib.request, urllib.parse, urllib.error
 from datetime import datetime, timezone, timedelta
 import jwt
@@ -25,12 +28,22 @@ import jwt
 BASE = "https://sheets.googleapis.com/v4/spreadsheets/"
 MON_TITLE = "Мониторинг цен"
 MSK = timezone(timedelta(hours=3))
-COLS = ["Артикул", "Товар (группа)", "Бренд", "Наша цена", "Мин. конкурент",
-        "Цена мин.", "% к мин.", "Медиана", "% к медиане", "Дешевле нас",
-        "Статус", "Обновлено", "% при уведомлении"]
+# Раскладка колонок: слева фиксированные, в середине — конкуренты ПОИМЁННО
+# (состав ведёт менеджер настройкой «Колонки конкурентов»), справа служебные.
+# Колонки «Медиана»/«% к медиане» убраны 30.07.2026. Имя самого дешёвого
+# конкурента осталось («Мин. конкурент»), рядом с ним — группа минимума (А/Б).
+# В каждой ячейке с конкурентом стоит его АРТИКУЛ: менеджер копирует его прямо
+# из ячейки и ищет карточку в поиске WB (правка Артура 31.07.2026).
+COLS_HEAD = ["Артикул", "Товар (группа)", "Бренд", "Наша цена"]
+COLS_TAIL = ["Мин. конкурент", "Цена мин.", "% к мин.", "Группа мин.",
+             "Дешевле нас", "Статус", "Обновлено", "% при уведомлении"]
 DEFAULTS = {"Порог, %": "5", "Получатели TG": "", "Часы работы (МСК)": "8-17",
             "Дни недели": "пн-пт", "Срочный порог, %": "",
             "Включён": "да", "Наши бренды": "NATURI, SUNSHINE, Health Form, 4ME, VEXOR, ORZAX",
+            "Якоря (группа А)": "Healthis, VitaMeal, PWR",
+            "Группа Б (не якорные)": "Miosuperfood, Miopharm, MISHIDO, GLS",
+            "Колонки конкурентов": "Healthis, VitaMeal, PWR, Miosuperfood, GLS",
+            "Сигнал без группы Б": "нет",
             "Разбивать по брендам": "нет", "Чаты по брендам": "",
             "Тест: всё в чат": ""}
 DAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
@@ -44,7 +57,16 @@ NOTE = ("порог работает в обе стороны: на стольк
         "(теряем продажи) или дешевле его же (отдаём маржу). «Дни недели»: пн-пт, "
         "пн-вс или список через запятую. «Срочный порог, %»: пусто = вне рабочего "
         "окна молчим; заполнено = и ночью, и в выходной придёт то, где разрыв "
-        "дорос до этого значения. «Чаты по брендам»: "
+        "дорос до этого значения. «Якоря (группа А)» — конкуренты, по которым "
+        "работает ценовое правило (стоять на 15–20 % ниже); «Группа Б» — "
+        "конкуренты второго эшелона: они остаются в таблице и в сообщениях, но "
+        "помечены отдельно, и настройкой «Сигнал без группы Б» = да их можно "
+        "выключить из расчёта минимума. «Колонки конкурентов» — чьи цены показывать "
+        "отдельными колонками листа (имя пишется как в колонке «Бренд» таблицы цен, "
+        "можно коротко: Miosuperfood поймает «Miosuperfood (Миофарм)»); конкурент, "
+        "которого в этой книге нет ни разу, колонку не получает. В ячейке "
+        "конкурента рядом с ценой стоит его артикул — копируйте прямо из ячейки. "
+        "«Чаты по брендам»: "
         "NATURI=-100…:5, SUNSHINE=-100…:7 — пусто = берётся из ключей отчёта. "
         "«Тест: всё в чат» — репетиция рассылки: разбивка по брендам включается "
         "принудительно, но все сообщения уходят в указанный чат с пометкой, куда "
@@ -68,8 +90,11 @@ MP_LABEL = "ВБ"
 # порядок строк в листе: самое горячее наверх. «Дороже» — риск потерять продажи,
 # «дешевле» — недобранная маржа; первое срочнее, поэтому идёт выше
 RANK = {"дороже": 0, "дешевле": 1, "ок": 2, "нет конкурентов": 3, "нет цены": 4}
-# ширины колонок листа (px), под COLS; последняя (тех. поле) прячется
-WIDTHS = [95, 300, 105, 90, 165, 90, 85, 90, 105, 100, 105, 105, 120]
+# ширины колонок листа (px): фиксированные — конкуренты — служебные.
+# последняя (тех. поле «% при уведомлении») прячется
+W_HEAD = [95, 300, 105, 90]
+W_COMP = 135          # цена + артикул конкурента в одной ячейке
+W_TAIL = [200, 90, 85, 100, 100, 105, 105, 120]
 # Заливка строки по разрыву с минимумом конкурента. Красная шкала — мы дороже
 # (чем краснее, тем срочнее), зелёная — мы дешевле всех с большим отрывом
 # (можно поднять цену и остаться самыми дешёвыми). Границы в %.
@@ -82,15 +107,74 @@ WHITE, GRAY = "#FFFFFF", "#EFEFEF"
 esc = lambda s: html.escape(str(s), quote=True)
 
 
+class Layout:
+    """Раскладка колонок листа под текущий состав конкурентов.
+
+    Колонок конкурентов может быть сколько угодно (их задаёт менеджер), поэтому
+    индексы служебных полей СЧИТАЮТСЯ, а не забиты числами — иначе добавленный
+    конкурент молча сдвигает «Статус» и состояние читается не из той ячейки.
+    """
+
+    def __init__(self, comp_cols):
+        self.comp = list(comp_cols)
+        self.cols = COLS_HEAD + self.comp + COLS_TAIL
+        self.widths = W_HEAD + [W_COMP] * len(self.comp) + W_TAIL
+        self.i_price = 3
+        self.i_comp0 = len(COLS_HEAD)
+        n = len(COLS_HEAD) + len(self.comp)
+        (self.i_who, self.i_min, self.i_dmin, self.i_grp, self.i_cheaper,
+         self.i_status, self.i_upd, self.i_pts) = range(n, n + len(COLS_TAIL))
+
+    def __len__(self):
+        return len(self.cols)
+
+
+def split_list(raw):
+    return [p.strip() for p in str(raw).split(",") if p.strip()]
+
+
+def comp_cell(pa):
+    """Ячейка колонки конкурента: «цена · артикул».
+
+    Артикул нужен рядом с ценой, потому что менеджер ищет чужую карточку в
+    поиске WB копипастом из этой самой ячейки (просьба Артура 31.07.2026).
+    Ячейка от этого становится текстовой — рублёвый формат к ней не применяем.
+    """
+    if not pa:
+        return ""
+    price, art = pa
+    return f"{price} ₽ · {art}"
+
+
+def norm_brand(s):
+    return re.sub(r"[^0-9a-zа-я]+", "", str(s).lower())
+
+
+def brand_in(brand, names):
+    """Какому имени из настроек соответствует бренд строки. None — никакому.
+
+    Менеджер пишет короткое имя («Miosuperfood», «PWR»), а в колонке «Бренд»
+    таблицы цен стоит «Miosuperfood (Миофарм)», «PWR ultimate power», «Mishido»
+    в другом регистре — поэтому сравнение по префиксу нормализованной строки,
+    а не по равенству.
+    """
+    b = norm_brand(brand)
+    for n in names:
+        n2 = norm_brand(n)
+        if n2 and (b == n2 or b.startswith(n2)):
+            return n
+    return None
+
+
 def rgb(hexstr):
     h = hexstr.lstrip("#")
     return {"red": int(h[0:2], 16) / 255, "green": int(h[2:4], 16) / 255,
             "blue": int(h[4:6], 16) / 255}
 
 
-def row_style(row):
+def row_style(s):
     """Цвет и жирность строки листа по её статусу и разрыву с минимумом."""
-    status, d_min = row[10], row[6]
+    status, d_min = s["status"], s["d_min"]
     if isinstance(d_min, (int, float)):
         if status == "дороже":
             for edge, color, bold in BANDS_UP:
@@ -107,7 +191,7 @@ def row_style(row):
     return WHITE, False
 
 
-def decorate(sheet_id, tok, gid, out, need_rows, has_alerts):
+def decorate(sheet_id, tok, gid, styles, need_rows, has_alerts, L):
     """Оформление листа: заливка строк по остроте, форматы чисел, ширины.
 
     Цвета считаются здесь и кладутся статикой, а НЕ условным форматированием:
@@ -119,35 +203,37 @@ def decorate(sheet_id, tok, gid, out, need_rows, has_alerts):
                 "range": {"sheetId": gid, "dimension": "COLUMNS",
                           "startIndex": i, "endIndex": i + 1},
                 "properties": {"pixelSize": w}, "fields": "pixelSize"}}
-            for i, w in enumerate(WIDTHS)]
+            for i, w in enumerate(L.widths)]
     reqs.append({"updateDimensionProperties": {           # тех. поле анти-спама
         "range": {"sheetId": gid, "dimension": "COLUMNS",
-                  "startIndex": len(COLS) - 1, "endIndex": len(COLS)},
+                  "startIndex": L.i_pts, "endIndex": L.i_pts + 1},
         "properties": {"hiddenByUser": True}, "fields": "hiddenByUser"}})
 
     body = {"startRowIndex": FIRST_DATA_ROW - 1, "endRowIndex": need_rows,
-            "startColumnIndex": 0, "endColumnIndex": len(COLS)}
+            "startColumnIndex": 0, "endColumnIndex": len(L)}
     reqs.append({"repeatCell": {"range": {"sheetId": gid, **body},
         "cell": {"userEnteredFormat": {"backgroundColor": rgb(WHITE),
                                        "textFormat": {"bold": False}}},
         "fields": "userEnteredFormat(backgroundColor,textFormat.bold)"}})
 
     band_start, band_style, i = 0, None, 0
-    for i, row in enumerate(out):
-        st = row_style(row)
+    for i, st in enumerate(styles):
         if band_style is None:
             band_style = st
         elif st != band_style:
             reqs.append(paint(gid, FIRST_DATA_ROW - 1 + band_start,
-                              FIRST_DATA_ROW - 1 + i, band_style))
+                              FIRST_DATA_ROW - 1 + i, band_style, L))
             band_start, band_style = i, st
-    if out and band_style is not None:
+    if styles and band_style is not None:
         reqs.append(paint(gid, FIRST_DATA_ROW - 1 + band_start,
-                          FIRST_DATA_ROW - 1 + len(out), band_style))
+                          FIRST_DATA_ROW - 1 + len(styles), band_style, L))
 
-    for cols, fmt in (((3, 4), None), ((5, 6), None), ((7, 8), None),
-                      ((6, 7), '0.0"%"'), ((8, 9), '0.0"%"')):
-        pattern = fmt or '#,##0" ₽"'
+    # Рублёвый формат — только «наша цена» и «цена мин.»: в колонках конкурентов
+    # с 31.07.2026 лежит текст «цена · артикул», числовой формат к нему неприменим
+    # (и молча съел бы артикул при попытке разобрать ячейку как число).
+    for cols, pattern in (((L.i_price, L.i_price + 1), '#,##0" ₽"'),
+                          ((L.i_min, L.i_min + 1), '#,##0" ₽"'),
+                          ((L.i_dmin, L.i_dmin + 1), '0.0"%"')):
         reqs.append({"repeatCell": {
             "range": {"sheetId": gid, "startRowIndex": FIRST_DATA_ROW - 1,
                       "endRowIndex": need_rows,
@@ -159,7 +245,7 @@ def decorate(sheet_id, tok, gid, out, need_rows, has_alerts):
     reqs.append({"repeatCell": {
         "range": {"sheetId": gid, "startRowIndex": SUMMARY_ROW - 1,
                   "endRowIndex": SUMMARY_ROW, "startColumnIndex": 0,
-                  "endColumnIndex": len(COLS)},
+                  "endColumnIndex": len(L)},
         "cell": {"userEnteredFormat": {
             "backgroundColor": rgb("#F4CCCC" if has_alerts else "#D9EAD3"),
             "textFormat": {"bold": True}}},
@@ -168,11 +254,11 @@ def decorate(sheet_id, tok, gid, out, need_rows, has_alerts):
     api(sheet_id + ":batchUpdate", tok, "POST", {"requests": reqs})
 
 
-def paint(gid, r0, r1, style):
+def paint(gid, r0, r1, style, L):
     color, bold = style
     return {"repeatCell": {
         "range": {"sheetId": gid, "startRowIndex": r0, "endRowIndex": r1,
-                  "startColumnIndex": 0, "endColumnIndex": len(COLS)},
+                  "startColumnIndex": 0, "endColumnIndex": len(L)},
         "cell": {"userEnteredFormat": {"backgroundColor": rgb(color),
                                        "textFormat": {"bold": bold}}},
         "fields": "userEnteredFormat(backgroundColor,textFormat.bold)"}}
@@ -288,7 +374,11 @@ def find_sheet(sheet_id, tok, title):
 
 
 def ensure_monitor(sheet_id, tok, sheets, tg_default, dry=False):
-    """Лист «Мониторинг цен»: создать/переложить шапку, вернуть (gid, настройки, состояние).
+    """Лист «Мониторинг цен»: создать при отсутствии, прочитать настройки и состояние.
+
+    Возвращает (gid, настройки, состояние, строка старой шапки, старые заголовки).
+    Раскладку НЕ перекладывает: состав колонок зависит от настроек И от данных
+    книги, которые читаются позже, — этим занимается layout_sheet().
 
     Идемпотентно: addSheet мог пройти на сервере, а ответ — потеряться в сети,
     тогда ретрай вернёт 400 «already exists» — это не ошибка, лист просто есть.
@@ -302,14 +392,14 @@ def ensure_monitor(sheet_id, tok, sheets, tg_default, dry=False):
     if not props and dry:
         print(f"  dry-run: листа «{MON_TITLE}» нет, работаю на дефолтных настройках")
         d = dict(DEFAULTS); d["Получатели TG"] = tg_default
-        return None, d, {}
+        return None, d, {}, None, []
     if not props:
         print(f"Лист «{MON_TITLE}» не найден — создаю")
         try:
             res = api(sheet_id + ":batchUpdate", tok, "POST", {"requests": [
                 {"addSheet": {"properties": {"title": MON_TITLE,
                                              "gridProperties": {"rowCount": 500,
-                                                                "columnCount": len(COLS)}}}}]})
+                                                                "columnCount": 30}}}}]})
             props = res["replies"][0]["addSheet"]["properties"]
         except urllib.error.HTTPError as e:
             if e.code != 400:
@@ -320,19 +410,19 @@ def ensure_monitor(sheet_id, tok, sheets, tg_default, dry=False):
             print("  лист уже был создан (ответ на создание потерялся) — продолжаю")
 
     q = urllib.parse.quote("'" + MON_TITLE + "'")
-    vals = api(f"{sheet_id}/values/{q}!A1:M2000?valueRenderOption=FORMATTED_VALUE",
+    vals = api(f"{sheet_id}/values/{q}!A1:AZ2000?valueRenderOption=FORMATTED_VALUE",
                tok).get("values", [])
 
     # где шапка таблицы стоит СЕЙЧАС: раскладка могла быть сделана прошлой
-    # версией скрипта с другим числом настроек
-    old_head = None
-    for idx, row in enumerate(vals[:30], 1):
-        if row and row[0].strip() == COLS[0]:
-            old_head = idx
+    # версией скрипта — с другим числом настроек и другим составом колонок
+    old_head, old_cols = None, []
+    for idx, row in enumerate(vals[:40], 1):
+        if row and row[0].strip() == COLS_HEAD[0]:
+            old_head, old_cols = idx, [str(c).strip() for c in row]
             break
 
     cfg = dict(DEFAULTS)
-    for row in vals[:(old_head - 1) if old_head else 30]:
+    for row in vals[:(old_head - 1) if old_head else 40]:
         if len(row) > 1 and row[0].strip() in DEFAULTS:
             cfg[row[0].strip()] = row[1].strip()
     if not cfg["Получатели TG"].strip():
@@ -340,54 +430,83 @@ def ensure_monitor(sheet_id, tok, sheets, tg_default, dry=False):
 
     state = {}
     if old_head:
+        # Колонки состояния ищем ПО ИМЕНИ заголовка, а не по номеру: состав
+        # колонок теперь подвижен (у каждого якорного конкурента своя), а
+        # «уже уведомляли» обязано пережить перестройку листа — иначе первый же
+        # прогон после релиза отправит всю базу заново как новые сигналы.
+        i_st = old_cols.index("Статус") if "Статус" in old_cols else None
+        i_pt = (old_cols.index("% при уведомлении")
+                if "% при уведомлении" in old_cols else None)
+
+        def cell(row, i):
+            return str(row[i]).strip() if (i is not None and len(row) > i) else ""
+
         for row in vals[old_head:]:
-            art = (row[0].strip() if row else "")
+            art = (str(row[0]).strip() if row else "")
             # ключ — пара «артикул + группа»: один и тот же nmID конкурента (и наш)
             # может стоять сразу в нескольких товарных группах (боевой случай VEXOR)
-            grp = (row[1].strip() if len(row) > 1 else "")
+            grp = (str(row[1]).strip() if len(row) > 1 else "")
             if art.isdigit():
-                state[(art, grp)] = {"статус": (row[10].strip() if len(row) > 10 else ""),
-                                     "пункты": as_num(row[12]) if len(row) > 12 else None}
+                state[(art, grp)] = {"статус": cell(row, i_st),
+                                     "пункты": as_num(cell(row, i_pt))}
+    return props["sheetId"], cfg, state, old_head, old_cols
 
-    if old_head != HEAD_ROW and dry:
-        print(f"  dry-run: раскладку не трогаю (шапка в строке {old_head or '—'})")
-    elif old_head != HEAD_ROW:
-        # Перекладываем верх листа: настройки записываем ТЕКУЩИМИ значениями
-        # (иначе правки пользователя сбросятся на дефолты), состояние уже прочитано
-        # выше, а данные всё равно переписываются каждый прогон.
-        print(f"  раскладка: шапка {old_head or 'отсутствует'} → строка {HEAD_ROW}")
-        api(f"{sheet_id}/values/{q}!A1:M2000:clear", tok, "POST", {})
-        blank = [""] * len(COLS)
-        # строки пишем на всю ширину: values.update трогает только переданные
-        # ячейки, и остатки прежней раскладки иначе переживут перезапись
-        rows = [["Настройки мониторинга цен", "", NOTE] + [""] * (len(COLS) - 3)]
-        rows += [[k, cfg[k]] + [""] * (len(COLS) - 2) for k in DEFAULTS]
-        rows.append(list(blank))
-        rows.append(["Сейчас", ""] + [""] * (len(COLS) - 2))
-        rows.append(list(COLS))
-        assert len(rows) == HEAD_ROW, (len(rows), HEAD_ROW)
-        api(sheet_id + "/values:batchUpdate", tok, "POST", {"valueInputOption": "USER_ENTERED",
-            "data": [{"range": f"'{MON_TITLE}'!A1", "values": rows}]})
-        api(sheet_id + ":batchUpdate", tok, "POST", {"requests": [
-            # сбросить заливку прежней раскладки: старая строка «Сейчас» иначе
-            # останется розовой уже на месте обычной настройки
-            {"repeatCell": {"range": {"sheetId": props["sheetId"], "startRowIndex": 0,
-                                      "endRowIndex": HEAD_ROW, "startColumnIndex": 0,
-                                      "endColumnIndex": len(COLS)},
-                            "cell": {"userEnteredFormat": {"backgroundColor": rgb(WHITE),
-                                                           "textFormat": {"bold": False}}},
-                            "fields": "userEnteredFormat(backgroundColor,textFormat.bold)"}},
-            {"repeatCell": {"range": {"sheetId": props["sheetId"], "startRowIndex": 0, "endRowIndex": 1},
-                            "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
-                            "fields": "userEnteredFormat.textFormat.bold"}},
-            {"repeatCell": {"range": {"sheetId": props["sheetId"], "startRowIndex": HEAD_ROW - 1,
-                                      "endRowIndex": HEAD_ROW},
-                            "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
-                            "fields": "userEnteredFormat.textFormat.bold"}},
-            {"updateSheetProperties": {"properties": {"sheetId": props["sheetId"],
-                                                      "gridProperties": {"frozenRowCount": HEAD_ROW}},
-                                       "fields": "gridProperties.frozenRowCount"}}]})
-    return props["sheetId"], cfg, state
+
+def layout_sheet(sheet_id, tok, gid, cfg, L, old_head, old_cols, dry=False):
+    """Верх листа: блок настроек, строка «Сейчас», шапка таблицы.
+
+    Пишет, только если раскладка разъехалась — сменилось число настроек или
+    состав колонок конкурентов. При dry=True не трогает ничего (см. ensure_monitor).
+    """
+    if old_head == HEAD_ROW and old_cols == L.cols:
+        return
+    why = ("шапка {} → строка {}".format(old_head or "отсутствует", HEAD_ROW)
+           if old_head != HEAD_ROW else "сменился состав колонок конкурентов")
+    if dry:
+        print(f"  dry-run: раскладку не трогаю ({why})")
+        return
+    # Перекладываем верх листа: настройки записываем ТЕКУЩИМИ значениями
+    # (иначе правки пользователя сбросятся на дефолты), состояние уже прочитано
+    # раньше, а данные всё равно переписываются каждый прогон.
+    print(f"  раскладка: {why}")
+    q = urllib.parse.quote("'" + MON_TITLE + "'")
+    # ширину гарантируем ДО записи: у листа могло быть меньше колонок, чем нужно
+    # сейчас, и values.update ответил бы 400 «beyond the last requested column»
+    api(sheet_id + ":batchUpdate", tok, "POST", {"requests": [
+        {"updateSheetProperties": {
+            "properties": {"sheetId": gid, "gridProperties": {"columnCount": len(L)}},
+            "fields": "gridProperties.columnCount"}}]})
+    api(f"{sheet_id}/values/{q}!A1:AZ2000:clear", tok, "POST", {})
+    blank = [""] * len(L)
+    # строки пишем на всю ширину: values.update трогает только переданные
+    # ячейки, и остатки прежней раскладки иначе переживут перезапись
+    rows = [["Настройки мониторинга цен", "", NOTE] + [""] * (len(L) - 3)]
+    rows += [[k, cfg[k]] + [""] * (len(L) - 2) for k in DEFAULTS]
+    rows.append(list(blank))
+    rows.append(["Сейчас", ""] + [""] * (len(L) - 2))
+    rows.append(list(L.cols))
+    assert len(rows) == HEAD_ROW, (len(rows), HEAD_ROW)
+    api(sheet_id + "/values:batchUpdate", tok, "POST", {"valueInputOption": "USER_ENTERED",
+        "data": [{"range": f"'{MON_TITLE}'!A1", "values": rows}]})
+    api(sheet_id + ":batchUpdate", tok, "POST", {"requests": [
+        # сбросить заливку прежней раскладки: старая строка «Сейчас» иначе
+        # останется розовой уже на месте обычной настройки
+        {"repeatCell": {"range": {"sheetId": gid, "startRowIndex": 0,
+                                  "endRowIndex": HEAD_ROW, "startColumnIndex": 0,
+                                  "endColumnIndex": len(L)},
+                        "cell": {"userEnteredFormat": {"backgroundColor": rgb(WHITE),
+                                                       "textFormat": {"bold": False}}},
+                        "fields": "userEnteredFormat(backgroundColor,textFormat.bold)"}},
+        {"repeatCell": {"range": {"sheetId": gid, "startRowIndex": 0, "endRowIndex": 1},
+                        "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
+                        "fields": "userEnteredFormat.textFormat.bold"}},
+        {"repeatCell": {"range": {"sheetId": gid, "startRowIndex": HEAD_ROW - 1,
+                                  "endRowIndex": HEAD_ROW},
+                        "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
+                        "fields": "userEnteredFormat.textFormat.bold"}},
+        {"updateSheetProperties": {"properties": {"sheetId": gid,
+                                                  "gridProperties": {"frozenRowCount": HEAD_ROW}},
+                                   "fields": "gridProperties.frozenRowCount"}}]})
 
 
 def in_hours(cfg):
@@ -482,10 +601,17 @@ def main():
     sheets = sorted((s["properties"] for s in meta["sheets"]), key=lambda p: p.get("index", 0))
     book = meta["properties"]["title"]
 
-    gid, cfg, prev = ensure_monitor(a.sheet_id, tok, sheets,
-                                    K.get("PRICE_WATCH_TG_CHATS", ""), dry=a.dry_run)
+    gid, cfg, prev, old_head, old_cols = ensure_monitor(
+        a.sheet_id, tok, sheets, K.get("PRICE_WATCH_TG_CHATS", ""), dry=a.dry_run)
     thr_pct = as_num(cfg["Порог, %"]) or 5.0
     ours = {b.strip().lower() for b in cfg["Наши бренды"].split(",") if b.strip()}
+    # Группы конкурентов ведёт менеджер в листе, а не код: якоря (группа А) —
+    # те, по кому работает ценовое правило «стоять на 15–20 % ниже», группа Б —
+    # второй эшелон, который менеджер из правил исключил, но из таблицы не убрал.
+    anchors = split_list(cfg["Якоря (группа А)"])
+    group_b = split_list(cfg["Группа Б (не якорные)"])
+    comp_cols_cfg = split_list(cfg["Колонки конкурентов"]) or anchors
+    skip_b = cfg["Сигнал без группы Б"].strip().lower() in ("да", "yes", "1", "true")
     default_targets = parse_targets(cfg["Получатели TG"])
     split_brands = cfg["Разбивать по брендам"].strip().lower() in ("да", "yes", "1", "true")
     # Репетиция перед боевой рассылкой: разбивка считается включённой, но всё
@@ -529,7 +655,7 @@ def main():
     # Колонки ищем ПО ШАПКЕ, а не по буквам A/B/C: менеджеры заводят слева от дат
     # свои колонки (в книге автохимии это «Прогрев» и «Прогрев к-во», 31.07.2026),
     # и жёсткое «бренд = C» тихо превращает бренд в «да» — наших позиций
-    # находится ноль, а лист мониторинга обнуляется вместе с состоянием.
+    # находится ноль, лист мониторинга обнуляется вместе с состоянием.
     head = [str(x).strip().lower() for x in (rows[0] if rows else [])]
 
     def col_by(words, default):
@@ -565,25 +691,59 @@ def main():
     for i in items:
         groups.setdefault(i["group"], []).append(i)
 
+    # колонку получает только тот конкурент, который в этой книге реально есть:
+    # у таблицы автохимии свои конкуренты, и четыре пустых колонки БАДовых
+    # якорей были бы там мусором
+    comp_brands = [i["brand"] for i in items if i["brand"].strip().lower() not in ours]
+    comp_cols = [c for c in comp_cols_cfg if any(brand_in(b, [c]) for b in comp_brands)]
+    dropped = [c for c in comp_cols_cfg if c not in comp_cols]
+    if dropped:
+        print(f"  колонки конкурентов без данных в этой книге — не показываю: {dropped}")
+    L = Layout(comp_cols)
+    print(f"  колонки конкурентов: {comp_cols or '—'}; якоря (А): {anchors or '—'}; "
+          f"группа Б: {group_b or '—'}"
+          + (", группа Б исключена из расчёта минимума" if skip_b else ""))
+    layout_sheet(a.sheet_id, tok, gid, cfg, L, old_head, old_cols, dry=a.dry_run)
+
     cur, alerts, recovered = {}, [], []
     for g, lst in groups.items():
         mine = [i for i in lst if i["brand"].strip().lower() in ours]
-        comp = [(i["brand"], live[i["art"]]) for i in lst
+        comp = [(i["brand"], live[i["art"]], i["art"]) for i in lst
                 if i["brand"].strip().lower() not in ours and i["art"] in live]
+        # цена бренда из справочника в этой группе (если карточек несколько —
+        # самая дешёвая: сравниваем с лучшим предложением конкурента). Артикул
+        # едет вместе с ценой: он и есть то, что менеджер копирует из ячейки.
+        bprice = {}
+        for b, p, art in comp:
+            name = brand_in(b, comp_cols + anchors + group_b)
+            if name and p < bprice.get(name, (10 ** 9, ""))[0]:
+                bprice[name] = (p, art)
+        anch_prices = [bprice[x][0] for x in anchors if x in bprice]
+        # Минимум считается по всем конкурентам. Настройкой «Сигнал без группы Б»
+        # менеджер может выкинуть из него второй эшелон — тогда сигнал живёт по
+        # тем же брендам, по которым работает его ценовое правило.
+        base = [c for c in comp if not brand_in(c[0], group_b)] if skip_b else comp
+        if not base:
+            base = comp
         for i in mine:
             st = {"group": g, "brand": i["brand"], "price": live.get(i["art"]),
-                  "min_who": "", "min": None, "d_min": None, "med": None, "d_med": None,
-                  "cheaper": None, "status": "нет цены", "top": False}
-            if st["price"] and comp:
-                mn = min(comp, key=lambda x: x[1])
-                med = statistics.median([c[1] for c in comp])
-                st["min_who"], st["min"] = mn[0], mn[1]
-                st["med"] = round(med)
+                  "min_who": "", "min": None, "min_art": "", "d_min": None,
+                  "min_grp": "", "cheaper": None, "status": "нет цены",
+                  "top": False, "cols": bprice, "anch": None, "d_anch": None}
+            if st["price"] and base:
+                mn = min(base, key=lambda x: x[1])
+                st["min_who"], st["min"], st["min_art"] = mn[0], mn[1], mn[2]
+                st["min_grp"] = ("А" if brand_in(mn[0], anchors)
+                                 else "Б" if brand_in(mn[0], group_b) else "прочий")
                 st["d_min"] = round((st["price"] / mn[1] - 1) * 100, 1)
-                st["d_med"] = round((st["price"] / med - 1) * 100, 1)
-                st["cheaper"] = sum(1 for c in comp if c[1] < st["price"])
-                st["comp_n"] = len(comp)
-                st["top"] = st["cheaper"] == len(comp) and len(comp) > 0
+                st["cheaper"] = sum(1 for c in base if c[1] < st["price"])
+                st["comp_n"] = len(base)
+                st["top"] = st["cheaper"] == len(base) and len(base) > 0
+                if anch_prices:
+                    # ценовое правило Артура: стоять на 15–20 % ниже якорей,
+                    # поэтому считаем от самого дешёвого якоря
+                    st["anch"] = min(anch_prices)
+                    st["d_anch"] = round((st["price"] / st["anch"] - 1) * 100, 1)
 
             key = (i["art"], g)
             was = prev.get(key, {})
@@ -592,7 +752,7 @@ def main():
             # если отправка в TG упала, пункты не проставились и сигнал повторится
             notified = was_st in ("дороже", "дешевле") and was_pts is not None
 
-            if st["price"] and comp:
+            if st["price"] and base:
                 # Сигнал в обе стороны: дороже минимума конкурентов = теряем продажи,
                 # дешевле минимума = отдаём маржу (можно поднять цену и всё равно
                 # остаться самыми дешёвыми). Гистерезис: цены WB дёргаются на доли
@@ -673,14 +833,30 @@ def main():
             for gname, entries in ordered[:DETAIL_GROUPS]:
                 s0 = entries[0][1]
                 lines.append(f"<b>{esc(gname)}</b>")
-                lines.append(f"мин. {esc(s0['min_who'])} {s0['min']} ₽ · медиана {s0['med']} ₽ · "
+                # медиана убрана 30.07.2026: менеджер ориентируется на самого
+                # дешёвого, а медиана рисует рынок дороже, чем он есть
+                b_mark = " (группа Б)" if s0["min_grp"] == "Б" else ""
+                # артикул конкурента моноширинным: в Telegram тап по нему =
+                # «скопировать», дальше менеджер ищет карточку в WB
+                lines.append(f"мин. {esc(s0['min_who'])} <code>{esc(s0['min_art'])}</code> "
+                             f"{s0['min']} ₽{b_mark} · "
                              f"конкурентов {s0.get('comp_n', 0)}")
+                if s0["cols"]:
+                    # топ-конкуренты поимённо — вместо безымянного «мин. конкурент»
+                    lines.append("топ: " + " · ".join(
+                        f"{esc(c)} <code>{esc(s0['cols'][c][1])}</code> "
+                        f"{s0['cols'][c][0]} ₽"
+                        for c in comp_cols if c in s0["cols"]))
                 for key, s, kind in sorted(entries, key=lambda x: -sign * x[1]["d_min"]):
                     mark = "📈 " if kind == "рост" else ""
                     flag = " ‼️ дороже всех" if (sign > 0 and s["top"]) else ""
                     url = f"https://www.wildberries.ru/catalog/{key[0]}/detail.aspx"
-                    lines.append(f"{mark}• <a href=\"{url}\">{esc(s['brand'])}</a> {s['price']} ₽ — "
-                                 f"{s['d_min']:+}% к мин., {s['d_med']:+}% к медиане{flag}")
+                    # артикул отдельным словом и моноширинным: в Telegram по нему
+                    # тап = «скопировать», а из текста ссылки копировать неудобно
+                    anch = (f", {s['d_anch']:+}% к якорю" if s["d_anch"] is not None else "")
+                    lines.append(f"{mark}• <a href=\"{url}\">{esc(s['brand'])}</a> "
+                                 f"<code>{key[0]}</code> {s['price']} ₽ — "
+                                 f"{s['d_min']:+}% к мин.{anch}{flag}")
                     keys.add(key)
                 lines.append("")
             tail = ordered[DETAIL_GROUPS:]
@@ -688,7 +864,8 @@ def main():
                 lines.append(f"<b>Ещё {sum(len(e) for _, e in tail)} позиций (кратко):</b>")
                 for gname, entries in tail:
                     for key, s, kind in sorted(entries, key=lambda x: -sign * x[1]["d_min"]):
-                        lines.append(f"• {esc(gname)} — {esc(s['brand'])} {s['price']} ₽ "
+                        lines.append(f"• {esc(gname)} — {esc(s['brand'])} "
+                                     f"<code>{key[0]}</code> {s['price']} ₽ "
                                      f"({s['d_min']:+}% к мин. {s['min']} ₽)")
                         keys.add(key)
                 lines.append("")
@@ -709,7 +886,8 @@ def main():
         if part_recovered:
             lines.append(f"✅ <b>Вернулись к рынку: {len(part_recovered)}</b>")
             for key, s, was_st in part_recovered:
-                lines.append(f"• {esc(s['group'])} — {esc(s['brand'])} {s['price']} ₽ "
+                lines.append(f"• {esc(s['group'])} — {esc(s['brand'])} "
+                             f"<code>{key[0]}</code> {s['price']} ₽ "
                              f"(было «{was_st}», сейчас {s['d_min']:+}% к мин. {s['min']} ₽)")
                 keys.add(key)
             lines.append("")
@@ -804,35 +982,39 @@ def main():
         pts = s["d_min"] if key in sent_keys else was.get("пункты")
         if s["status"] not in ("дороже", "дешевле"):
             pts = ""
-        out.append([art, s["group"], s["brand"], s["price"] or "", s["min_who"],
-                    s["min"] if s["min"] is not None else "",
-                    s["d_min"] if s["d_min"] is not None else "",
-                    s["med"] if s["med"] is not None else "",
-                    s["d_med"] if s["d_med"] is not None else "",
-                    s["cheaper"] if s["cheaper"] is not None else "",
-                    s["status"], now_s, pts if pts is not None else ""])
+        out.append([art, s["group"], s["brand"], s["price"] or ""]
+                   + [comp_cell(s["cols"].get(c)) for c in comp_cols]
+                   + [f"{s['min_who']} {s['min_art']}".strip(),
+                      s["min"] if s["min"] is not None else "",
+                      s["d_min"] if s["d_min"] is not None else "",
+                      s["min_grp"],
+                      s["cheaper"] if s["cheaper"] is not None else "",
+                      s["status"], now_s, pts if pts is not None else ""])
 
     top_n = sum(1 for s in cur.values() if s["status"] == "дороже" and s["top"])
     no_price = sum(1 for s in cur.values() if s["status"] == "нет цены")
+    b_min = sum(1 for s in cur.values() if s["min_grp"] == "Б")
     summary = (f"дороже конкурентов: {total_over} из {len(cur)}"
                + (f" · дороже ВСЕХ в группе: {top_n}" if top_n else "")
                + f" · сильно дешевле рынка: {total_under}"
                + (f" · без цены (нет в наличии): {no_price}" if no_price else "")
+               + (f" · минимум держит группа Б: {b_min}" if b_min else "")
                + f" · порог {thr_pct}% · обновлено {now_s} МСК")
 
     need_rows = FIRST_DATA_ROW + len(out) + 20
-    last = col_letter(len(COLS) - 1)
+    last = col_letter(len(L) - 1)
     api(a.sheet_id + ":batchUpdate", tok, "POST", {"requests": [
         {"updateSheetProperties": {"properties": {"sheetId": gid,
                                                   "gridProperties": {"rowCount": need_rows,
-                                                                     "columnCount": len(COLS)}},
+                                                                     "columnCount": len(L)}},
                                    "fields": "gridProperties(rowCount,columnCount)"}}]})
     api(f"{a.sheet_id}/values/'{urllib.parse.quote(MON_TITLE)}'!A{FIRST_DATA_ROW}:{last}2000:clear",
         tok, "POST", {})
     api(a.sheet_id + "/values:batchUpdate", tok, "POST", {"valueInputOption": "USER_ENTERED",
         "data": [{"range": f"'{MON_TITLE}'!A{SUMMARY_ROW}", "values": [["Сейчас", summary]]},
                  {"range": f"'{MON_TITLE}'!A{FIRST_DATA_ROW}", "values": out}]})
-    decorate(a.sheet_id, tok, gid, out, need_rows, bool(total_over))
+    decorate(a.sheet_id, tok, gid, [row_style(s) for _, s in order],
+             need_rows, bool(total_over), L)
     print(f"лист «{MON_TITLE}»: записано {len(out)} строк, наверху — {out[0][1] if out else '—'}")
     print("DONE")
 

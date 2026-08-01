@@ -21,6 +21,7 @@ p.add_argument("--keys", required=True)
 p.add_argument("--chat-id", default="")
 p.add_argument("--file", default="")
 p.add_argument("--sheet-url", default="")
+p.add_argument("--no-send", action="store_true")  # только собрать картинку
 a = p.parse_args()
 
 K = {}
@@ -55,7 +56,7 @@ for part in raw.split(","):
 # один и тот же адрес мог прийти и общим, и брендовым (LOVE&DOVE: оба = личка
 # владельца) — иначе отчёт приходит туда дважды
 TARGETS = list(dict.fromkeys(TARGETS))
-if not TOK or not TARGETS:
+if not a.no_send and (not TOK or not TARGETS):
     print("ERROR: нет TELEGRAM_BOT_TOKEN / получателей"); sys.exit(1)
 
 # ---------- агрегаты (фильтр активных — как в build_excel) ----------
@@ -90,7 +91,12 @@ top_dn = sorted([m for m in movers if m[2] < 0], key=lambda m: m[2])[:5]
 W = 900
 GREEN, RED, DARK, GRAY, BG = (0, 128, 60), (200, 30, 50), (20, 40, 70), (110, 110, 110), (255, 255, 255)
 def font(sz, bold=False):
-    for path in (f"/usr/share/fonts/truetype/dejavu/DejaVuSans{'-Bold' if bold else ''}.ttf",):
+    # запасной load_default() — растровый и БЕЗ кириллицы: русские буквы
+    # выходят квадратиками, поэтому перебираем шрифты всех платформ
+    for path in (f"/usr/share/fonts/truetype/dejavu/DejaVuSans{'-Bold' if bold else ''}.ttf",
+                 rf"C:\Windows\Fonts\arial{'bd' if bold else ''}.ttf",
+                 rf"C:\Windows\Fonts\{'seguisb' if bold else 'segoeui'}.ttf",
+                 f"/Library/Fonts/Arial{' Bold' if bold else ''}.ttf"):
         if os.path.exists(path): return ImageFont.truetype(path, sz)
     return ImageFont.load_default()
 F_H1, F_H2, F_T, F_S = font(34, True), font(26, True), font(22), font(22, True)
@@ -131,6 +137,9 @@ d.text((24, HH - 40), "Только активные артикулы · WB+Ozon
        font=font(17), fill=GRAY)
 img_path = os.path.join(tempfile.gettempdir(), f"tg_{BRAND}_{ddmm(Y)}.png")
 img.save(img_path)
+print("img:", img_path)
+if a.no_send:
+    print("NO SEND"); sys.exit(0)
 
 # ---------- отправка ----------
 def multipart(url, fields, file_field, file_path, mime):

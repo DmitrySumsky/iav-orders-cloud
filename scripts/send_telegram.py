@@ -9,7 +9,7 @@
       [--chat-id <id>] [--file <отчёт.xlsx>] [--sheet-url <ссылка на таблицу>]
 chat-id по умолчанию — TELEGRAM_CHAT_ID из api_keys.txt.
 """
-import argparse, json, os, sys, urllib.request, uuid
+import argparse, json, os, sys, tempfile, urllib.request, uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import norm, load_map, base_art
@@ -129,7 +129,7 @@ y += 10
 block("Топ падение:", top_dn, RED)
 d.text((24, HH - 40), "Только активные артикулы · WB+Ozon · источник: API площадок",
        font=font(17), fill=GRAY)
-img_path = f"/tmp/tg_{BRAND}_{ddmm(Y)}.png"
+img_path = os.path.join(tempfile.gettempdir(), f"tg_{BRAND}_{ddmm(Y)}.png")
 img.save(img_path)
 
 # ---------- отправка ----------

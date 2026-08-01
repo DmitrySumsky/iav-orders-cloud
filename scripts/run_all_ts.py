@@ -218,7 +218,12 @@ if K.get("SVOD_GSHEET_ID"):
             summary_f = os.path.join(STATE, "svod_summary.json")
             day = ""
             try:
-                day = json.load(open(summary_f, encoding="utf-8")).get("date", "")
+                sm = json.load(open(summary_f, encoding="utf-8"))
+                day = sm.get("date", "")
+                # площадка отдала ноль при живом предыдущем дне — данные неполные,
+                # сводка уходит с пометкой, но мы должны узнать об этом сразу
+                for e in sm.get("errors") or []:
+                    warnings.append(f"Свод: {e}")
             except Exception:
                 pass
             sent_flag = os.path.join(STATE, f"sent_SVOD_{day}.json")

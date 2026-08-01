@@ -36,7 +36,8 @@ import argparse, json, re, sys, os, time, urllib.request, urllib.parse, urllib.e
 from datetime import timedelta, datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from collect_ts import load_keys, ts_products
+from collect_ts import load_keys, ts_products, wb_funnel_async
+from direct_orders import ozon_units, wb_units, pick_source
 
 MSK = timezone(timedelta(hours=3))
 MAPR = "Маппинг позиций"
@@ -91,6 +92,46 @@ want_days = [(datetime.fromisoformat(DAY).date() - timedelta(days=i)).isoformat(
              for i in range(BACKFILL)]
 
 errors = []
+probe, checked, frozen = {}, set(), set()   # что сверяли и где источник замёрз
+
+def direct_day(prefix, disp, mp, day, ids, ts_day):
+    """Заказы за день из API маркетплейса, когда TrueStats «заморожен».
+
+    TrueStats при остановке своего сбора отвечает 200 с нулями, а не ошибкой
+    (31.07.2026 — Ozon по всем кабинетам), поэтому подозрительный день
+    сверяется с первоисточником; побеждает источник с бОльшим числом заказов
+    (см. direct_orders).  Возвращает {артикул: шт}.
+    """
+    cur = {k: {"orders": v, "sum": 0} for k, v in ts_day.items()}
+    fresh = {}
+    try:
+        if mp == "OZON":
+            fresh = ozon_units(K.get(f"{prefix}_OZON_CLIENT_ID", ""),
+                               K.get(f"{prefix}_OZON_API_KEY", ""), day, ids)
+        else:
+            wb_tok = K.get(f"{prefix}_WB_TOKEN", "")
+            if not wb_tok: return ts_day
+            # аналитика WB ночью не дозревает — пересобранный отчёт за день
+            # обычно полнее того, что успел забрать ночной прогон
+            fun = wb_funnel_async(wb_tok, day, day, wait_sec=240) or {}
+            for nm, days in fun.items():
+                n = (days.get(day) or {}).get("orders", 0) or 0
+                if n:
+                    k = ids.get(str(nm)) or str(nm)
+                    fresh.setdefault(k, {"orders": 0, "sum": 0})["orders"] += n
+            try:
+                st = wb_units(wb_tok, day, ids)
+                if sum(v["orders"] for v in st.values()) > sum(v["orders"] for v in fresh.values()):
+                    fresh = st
+            except Exception as e:
+                print(f"WB {disp} {day}: statistics-api не ответил ({str(e)[:80]})")
+    except Exception as e:
+        print(f"{mp} {disp} {day}: сверка с API не вышла ({str(e)[:100]})")
+        return ts_day
+    use, took, msg = pick_source(cur, fresh, f"{mp} {disp} {day}")
+    print(msg)
+    return {k: v["orders"] for k, v in use.items() if v["orders"]} if took else ts_day
+
 for disp, prefix in BRANDS:
     contour = K.get(f"{prefix}_TS_TOKEN", "")
     token = K.get(f"TRUESTATS_TOKEN_{contour.upper()}", "")
@@ -112,14 +153,54 @@ for disp, prefix in BRANDS:
                 else:
                     print(f"{mp} {disp} {day}: история не добрана ({str(e)[:80]})")
                 continue
-            d = {}
+            d, ids = {}, {}
             for r in rows:
-                art = (r.get("vendorCode") or str(r.get("article") or "")).strip()
+                rid = str(r.get("article") or "")
+                art = (r.get("vendorCode") or rid).strip()
+                if rid: ids[rid] = r.get("vendorCode") or ""
                 n = r.get("ordersCount") or 0
                 if art and n: d[art] = d.get(art, 0) + n
+            # свежие дни сверяем с кабинетом: ноль или обвал больше 40 % к
+            # предыдущему дню чаще означают замерший TrueStats, чем реальность
+            if day in (DAY, PREV):
+                yday = (datetime.fromisoformat(day).date() - timedelta(days=1)).isoformat()
+                ref = sum(HIST[hkey].get(yday, {}).get(disp, {}).values())
+                probe[(hkey, day, disp)] = (prefix, mp, ids, sum(d.values()) or 0)
+                if sum(d.values()) < max(1, 0.6 * ref):
+                    d = direct_day(prefix, disp, mp, day, ids, d)
+                    if sum(d.values()) > probe[(hkey, day, disp)][3]:
+                        checked.add((hkey, day, disp)); frozen.add((hkey, day))
+                # прогонов за день несколько: если источник просел (429, замёрз),
+                # оставляем то, что уже добыл прошлый прогон
+                keep = HIST[hkey].get(day, {}).get(disp, {})
+                if sum(keep.values()) > sum(d.values()):
+                    print(f"{mp} {disp} {day}: источник дал {sum(d.values())} < "
+                          f"{sum(keep.values())} из прошлого прогона — оставляю прошлое")
+                    d = keep
             HIST[hkey].setdefault(day, {})[disp] = d
             time.sleep(0.3)
         print(f"{mp} {disp}: за {DAY} — {sum(HIST[hkey].get(DAY, {}).get(disp, {}).values())} шт")
+
+# Заморозка источника — общая для всех кабинетов: если хоть у одного бренда
+# день пришлось брать из API, у остальных просадка того же дня тоже подозрительна
+# (31.07.2026: у 4me WB было 542 против 900 — до порога не дотянуло, а правда
+# оказалась больше). Досверяем их вторым проходом.
+for hkey, day in sorted(frozen):
+    for (hk, d_, disp), (prefix, mp, ids, was) in list(probe.items()):
+        if (hk, d_) != (hkey, day) or (hk, d_, disp) in checked: continue
+        keep = HIST[hk].get(d_, {}).get(disp, {})
+        fixed = direct_day(prefix, disp, mp, d_, ids, keep)
+        if sum(fixed.values()) >= sum(keep.values()):
+            HIST[hk].setdefault(d_, {})[disp] = fixed
+        checked.add((hk, d_, disp))
+
+# площадка целиком по нулям при живом предыдущем дне — это сбой источника, а
+# не день без продаж: помечаем отчёт неполным (шапка листов + подпись картинки)
+for hkey, mp in (("wb", "WB"), ("oz", "Ozon")):
+    day_tot = sum(sum(v.values()) for v in HIST[hkey].get(DAY, {}).values())
+    prev_tot = sum(sum(v.values()) for v in HIST[hkey].get(PREV, {}).values())
+    if not day_tot and prev_tot:
+        errors.append(f"{mp}: источник отдал 0 заказов за {DAY} (накануне {prev_tot})")
 
 cutoff = (datetime.fromisoformat(DAY).date() - timedelta(days=60)).isoformat()
 for hkey in ("wb", "oz"):

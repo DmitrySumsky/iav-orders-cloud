@@ -18,6 +18,7 @@ from datetime import date, timedelta, datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import load_map, base_art
 from collect_ts import load_keys, ts_products
+from direct_orders import ozon_units, wb_units, pick_source, total as dtotal
 
 MSK = timezone(timedelta(hours=3))
 
@@ -50,26 +51,65 @@ def add(base, day, platform, n):
     d = H["data"].setdefault(base, {}).setdefault(day, {"wb": 0, "oz": 0})
     d[platform] = d.get(platform, 0) + n
 
+def clear(day, platform):
+    """Стереть день перед перезаписью — иначе повторный сбор удвоит числа."""
+    for per in H["data"].values():
+        if day in per: per[day][platform] = 0
+
 def fill(day, accounts, platform):
+    """Кладёт заказы за день в историю. TrueStats — основной источник, но при
+    его «заморозке» (нули вместо данных, см. direct_orders) день берётся из
+    API маркетплейса."""
     rows = ts_products(token, accounts, day, day)
+    ts_map, ids = {}, {}
     for r in rows:
-        art = r.get("vendorCode") or str(r.get("article") or "")
+        rid, art = str(r.get("article") or ""), r.get("vendorCode") or ""
+        key = art or rid
+        if rid: ids[rid] = art
         n = r.get("ordersCount") or 0
-        if art and n:
-            add(base_art(art, MAP), day, platform, n)
-    return len(rows)
+        if key and n:
+            slot = ts_map.setdefault(key, {"orders": 0, "sum": 0})
+            slot["orders"] += n
+    use = ts_map
+    if platform == "wb" and K.get(f"{prefix}_WB_TOKEN") and not dtotal(ts_map) and day in RECHECK:
+        try:
+            use, took, msg = pick_source(ts_map, wb_units(K[f"{prefix}_WB_TOKEN"], day, ids),
+                                         f"WB история {day}")
+            print(msg)
+        except Exception as e:
+            print(f"WB история {day}: сверка не вышла ({str(e)[:80]})")
+    if platform == "oz" and K.get(f"{prefix}_OZON_API_KEY") and not dtotal(ts_map):
+        try:
+            fresh = ozon_units(K.get(f"{prefix}_OZON_CLIENT_ID", ""),
+                               K[f"{prefix}_OZON_API_KEY"], day, ids)
+            use, took, msg = pick_source(ts_map, fresh, f"Ozon история {day}")
+            print(msg)
+        except Exception as e:
+            print(f"Ozon история {day}: сверка не вышла ({str(e)[:80]})")
+    old = sum((per.get(day) or {}).get(platform, 0) for per in H["data"].values())
+    if dtotal(use) < old:      # источник просел — сохранённое лучше нового
+        print(f"{platform} {day}: источник дал {dtotal(use)} < {old} — оставляю прошлое")
+        return len(rows), old
+    clear(day, platform)
+    for key, v in use.items():
+        if v["orders"]: add(base_art(key, MAP), day, platform, v["orders"])
+    return len(rows), dtotal(use)
+
+# последние дни перекачиваем всегда: у маркетплейсов данные дозревают, а
+# «замороженный» TrueStats мог записать в историю нули как факт
+RECHECK = set(want[:3])
 
 changed = False
 for day in sorted(want):
-    if ts_wb and day not in H["wb_dates"]:
-        n = fill(day, ts_wb, "wb")
+    if ts_wb and (day not in H["wb_dates"] or day in RECHECK):
+        n, tot = fill(day, ts_wb, "wb")
         H["wb_dates"] = sorted(set(H["wb_dates"]) | {day}); changed = True
-        print(f"WB {day}: {n} строк из TrueStats")
+        print(f"WB {day}: {n} строк, заказов {tot}")
         time.sleep(0.3)
-    if ts_oz and day not in H["oz_dates"]:
-        n = fill(day, ts_oz, "oz")
+    if ts_oz and (day not in H["oz_dates"] or day in RECHECK):
+        n, tot = fill(day, ts_oz, "oz")
         H["oz_dates"] = sorted(set(H["oz_dates"]) | {day}); changed = True
-        print(f"Ozon {day}: {n} строк из TrueStats")
+        print(f"Ozon {day}: {n} строк, заказов {tot}")
         time.sleep(0.3)
 
 if changed:

@@ -21,6 +21,9 @@
 import argparse, io, json, os, re, sys, time, urllib.request, urllib.error, uuid, zipfile
 from datetime import date, timedelta, datetime, timezone
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from direct_orders import ozon_units, wb_units, pick_source, total as dtotal
+
 MSK = timezone(timedelta(hours=3))
 TS_BASE = "https://api.truestats.ru"
 WB_AN = "https://seller-analytics-api.wildberries.ru"
@@ -198,6 +201,20 @@ def main():
                 print(f"ВНИМАНИЕ: {state_f} повреждён/чужой — пересоздаю"); S = None
         except Exception:
             print(f"ВНИМАНИЕ: {state_f} не читается — пересоздаю"); S = None
+    # Снимок уже собранных заказов: прогонов за день несколько (06:45 сбор,
+    # 07:30 отправка), и если во втором источник «просел» (замёрзший TrueStats,
+    # 429 у WB), нельзя затирать то, что первый прогон уже добыл.
+    def snapshot(state):
+        if not isinstance(state, dict): return {}
+        snap = {}
+        for day in (d_prev, d_yest):
+            snap[("wb", day)] = {nm: (v.get(day) or {}).get("orders", 0) or 0
+                                 for nm, v in (state.get("wb_funnel") or {}).items()}
+            snap[("oz", day)] = {sku: (v.get(day) or {}).get("orders", 0) or 0
+                                 for sku, v in (state.get("ozon") or {}).items()}
+        return snap
+
+    SNAP = snapshot(S)
     if S is None:
         S = {
         "brand": a.brand, "yest": d_yest, "prev": d_prev,
@@ -272,6 +289,54 @@ def main():
             else:
                 print("WB воронка недоступна — в отчёте будут нули в переходах/корзинах")
 
+    # Сверка дня с первоисточниками. Неполный день приходит молча с обеих
+    # сторон: TrueStats при остановке своего сбора отдаёт нули, а аналитика WB
+    # ночью ещё не дозрела (31.07.2026 в 04 МСК отчёт WB давал у SUNSHINE 218
+    # заказов, к полудню — 574 за тот же день). Проверяем, когда день выглядит
+    # обрубленным, и берём источник с бОльшим числом заказов.
+    def verify_wb(force=False):
+        wb_tok = K.get(f"{prefix}_WB_TOKEN", "")
+        if not (ts_wb and wb_tok): return
+        funnel = S.setdefault("wb_funnel", {})
+        for day, base in ((d_yest, d_prev), (d_prev, None)):
+            def day_map():
+                return {nm: {"orders": (v.get(day) or {}).get("orders", 0) or 0,
+                             "sum": (v.get(day) or {}).get("orderSum", 0) or 0}
+                        for nm, v in funnel.items()}
+            cur = was = day_map()             # was — то, что попало в 14-дневный итог
+            ref = (sum((v.get(base) or {}).get("orders", 0) or 0 for v in funnel.values())
+                   if base else 0)
+            if not force and dtotal(cur) and (not base or dtotal(cur) >= 0.6 * ref):
+                continue                      # день выглядит целым — не тратим запросы
+            # 1) пересобрать отчёт WB: те же переходы/корзины, но дозревшие
+            fun = wb_funnel_async(wb_tok, day, day, wait_sec=240)
+            if fun:
+                for nm, days in fun.items():
+                    if day in days: funnel.setdefault(nm, {})[day] = days[day]
+                print(f"WB {day}: отчёт пересобран, заказов {dtotal(day_map())}")
+                cur = day_map()
+            # 2) statistics-api — первоисточник, но лимит 1 запрос в минуту на
+            # кабинет и его выедают сторонние сервисы, поэтому вторым
+            try:
+                use, took, msg = pick_source(cur, wb_units(wb_tok, day), f"WB заказы {day}")
+                print(msg)
+            except Exception as e:
+                print(f"WB сверка {day}: statistics-api не ответил ({str(e)[:80]})")
+                use, took = cur, False
+            if took:
+                for nm in set(cur) | set(use):
+                    slot = funnel.setdefault(nm, {}).setdefault(
+                        day, {"open": 0, "cart": 0, "orders": 0, "orderSum": 0})
+                    slot["orders"] = use.get(nm, {}).get("orders", 0)
+                    slot["orderSum"] = use.get(nm, {}).get("sum", 0) or slot.get("orderSum", 0)
+            if day == d_yest and S.get("wb_orders14") is not None:
+                for nm, v in day_map().items():   # 14 дней собраны из TrueStats
+                    S["wb_orders14"][nm] = max(   # — доливаем разницу за вчера
+                        0, (S["wb_orders14"].get(nm, 0) or 0)
+                        - was.get(nm, {}).get("orders", 0) + v["orders"])
+
+    ts_frozen = False       # TrueStats замёрз на этом дне (видно по Ozon)
+
     # ---------- Ozon из TrueStats ----------
     if ts_oz:
         day_rows = {d: ts_products(token, ts_oz, d, d) for d in (d_prev, d_yest)}
@@ -328,8 +393,52 @@ def main():
                     per["view"], per["view_pdp"], per["tocart"] = m[2], m[3], m[4]
                 time.sleep(1)
             print("Ozon воронка: ок")
+
+            # Сверка заказов с кабинетом Ozon — тот же ответ analytics/data,
+            # что и у старого сборщика. Стоит один запрос на день, поэтому
+            # проверяем оба дня всегда (TrueStats замерзал именно на Ozon).
+            for day in (d_prev, d_yest):
+                cur = {sku: {"orders": (v.get(day) or {}).get("orders", 0) or 0,
+                             "sum": (v.get(day) or {}).get("revenue", 0) or 0}
+                       for sku, v in oz.items()}
+                try:
+                    fresh = ozon_units(oz_id, oz_key, day)
+                except Exception as e:
+                    print(f"Ozon сверка {day}: не вышло ({str(e)[:80]})"); continue
+                use, took, msg = pick_source(cur, fresh, f"Ozon заказы {day}")
+                print(msg)
+                if took and not sum(v["orders"] for v in cur.values()):
+                    ts_frozen = True      # ноль вместо данных = сбор TS стоит
+                if took:
+                    for sku in set(cur) | set(use):
+                        rec = oz.setdefault(sku, {"name": "", "offer_id": ""})
+                        slot = rec.setdefault(day, {"orders": 0, "revenue": 0, "view": 0,
+                                                    "view_pdp": 0, "tocart": 0})
+                        was = slot.get("orders", 0) or 0
+                        slot["orders"] = use.get(sku, {}).get("orders", 0)
+                        slot["revenue"] = use.get(sku, {}).get("sum", 0) or slot.get("revenue", 0)
+                        if day == d_yest and S.get("oz_orders14") is not None:
+                            S["oz_orders14"][sku] = max(
+                                0, (S["oz_orders14"].get(sku, 0) or 0) + slot["orders"] - was)
+                time.sleep(1)
         else:
             print("Ozon воронка: нет ключей кабинета — пропуск")
+
+    # WB проверяем последним: если Ozon показал, что TrueStats стоит, WB-день
+    # сверяем принудительно — просадка там могла не дотянуть до порога
+    verify_wb(force=ts_frozen)
+
+    # заказы за день не уменьшаем: собранное прошлым прогоном лучше просевшего
+    for (kind, day), per in SNAP.items():
+        store = (S.get("wb_funnel") if kind == "wb" else S.get("ozon")) or {}
+        back = 0
+        for key, was in per.items():
+            slot = (store.get(key) or {}).get(day)
+            if slot and (slot.get("orders", 0) or 0) < was:
+                back += was - slot["orders"]; slot["orders"] = was
+        if back:
+            print(f"{'WB' if kind == 'wb' else 'Ozon'} {day}: источник просел, "
+                  f"вернул {back} шт из прошлого прогона")
 
     json.dump(S, open(state_f, "w"), ensure_ascii=False)
     if a.compare and cmp_report:

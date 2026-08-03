@@ -7,3 +7,4 @@ google_sa.json
 # результаты прогона
 reports/
 logs/
+.run_local.lock

@@ -8,7 +8,7 @@ run_all_ts.py, коммитит накопленную историю state/ и 
 Запуск:  python scripts/run_local.py [--skip-tg] [--brands "NATURI,4ME"] [--no-push]
 Пути к ключам переопределяются: LOCAL_KEYS, LOCAL_KEYS_EXTRA, LOCAL_SA.
 """
-import argparse, base64, os, shutil, subprocess, sys, datetime
+import argparse, base64, os, shutil, subprocess, sys, time, datetime
 
 # Консоль Windows по умолчанию cp1251: «×», «→» и прочее из вывода конвейера
 # роняли бы сам драйвер (UnicodeEncodeError) и обрывали дочерний процесс.
@@ -31,6 +31,48 @@ KEYS_OUT = os.path.join(ROOT, "api_keys.txt")
 SA_OUT = os.path.join(ROOT, "google_sa.json")
 MERGED = os.path.join(ROOT, "api_keys_merged.txt")
 LOGDIR = os.path.join(ROOT, "logs")
+LOCK = os.path.join(ROOT, ".run_local.lock")
+
+# Секреты лежат в общих файлах у корня репо, а clean_secrets() в finally сносит их
+# безусловно. Два прогона внахлёст = первый финишировавший вынес ключи из-под
+# второго: 03.08.2026 так и было (08:58 / 09:03 / 09:04), пять брендов из семи
+# упали на «нет TrueStats-настроек» и «api_keys_merged.txt не найден».
+LOCK_STALE_SEC = 6 * 3600
+
+
+def acquire_lock():
+    """Один прогон на репо. Возвращает False, если уже занято живым прогоном."""
+    while True:
+        try:
+            fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                age = time.time() - os.path.getmtime(LOCK)
+            except FileNotFoundError:
+                continue                     # владелец ушёл между попытками — пробуем снова
+            if age < LOCK_STALE_SEC:
+                try:
+                    who = open(LOCK, encoding="utf-8").read().strip()
+                except Exception:
+                    who = "?"
+                print(f"уже идёт другой прогон ({who}, {age/60:.0f} мин назад) — выхожу")
+                return False
+            print(f"замок протух ({age/3600:.1f} ч) — забираю")
+            try:
+                os.remove(LOCK)
+            except FileNotFoundError:
+                pass
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(f"pid={os.getpid()} started={datetime.datetime.now():%Y-%m-%d %H:%M:%S}")
+        return True
+
+
+def release_lock():
+    try:
+        os.remove(LOCK)
+    except FileNotFoundError:
+        pass
 
 
 def git(*args, token=None, check=False):
@@ -92,6 +134,15 @@ def main():
     ap.add_argument("--no-push", action="store_true", help="не коммитить и не пушить историю")
     a = ap.parse_args()
 
+    if not acquire_lock():
+        return 0                             # не сбой: чужой прогон делает ту же работу
+    try:
+        return run(a)
+    finally:
+        release_lock()
+
+
+def run(a):
     token = find_token()
     if not a.no_push:
         git("pull", "--rebase", "origin", "main", token=token)

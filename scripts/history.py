@@ -49,12 +49,12 @@ want_dates = [(yest - timedelta(days=i)).isoformat() for i in range(a.days)]
 state_f = os.path.join(a.state_dir, f"{prefix}_{yest.isoformat()}.json")
 if not os.path.exists(state_f):
     print(f"ERROR: нет {state_f} — сначала запусти collect.py"); sys.exit(1)
-S = json.load(open(state_f))
+S = json.load(open(state_f, encoding="utf-8"))
 
 hist_f = os.path.join(a.state_dir, f"history_{prefix}.json")
-H = json.load(open(hist_f)) if os.path.exists(hist_f) else \
+H = json.load(open(hist_f, encoding="utf-8")) if os.path.exists(hist_f) else \
     {"data": {}, "wb_done": [], "wb_dates": [], "oz_dates": []}
-def save(): json.dump(H, open(hist_f, "w"), ensure_ascii=False)
+def save(): json.dump(H, open(hist_f, "w", encoding="utf-8"), ensure_ascii=False)
 
 def http(url, headers=None, body=None, timeout=60, _tries=12, _net_tries=3):
     # Автоповтор при 429/5xx и сетевых сбоях: один IP GitHub упирается в

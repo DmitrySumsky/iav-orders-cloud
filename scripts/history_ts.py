@@ -43,7 +43,7 @@ yest = today - timedelta(days=1)
 want = [(yest - timedelta(days=i)).isoformat() for i in range(a.days)]
 
 hist_f = os.path.join(a.state_dir, f"history_{prefix}.json")
-H = json.load(open(hist_f)) if os.path.exists(hist_f) else \
+H = json.load(open(hist_f, encoding="utf-8")) if os.path.exists(hist_f) else \
     {"data": {}, "wb_done": [], "wb_dates": [], "oz_dates": []}
 MAP = load_map(a.state_dir, prefix)
 
@@ -113,7 +113,7 @@ for day in sorted(want):
         time.sleep(0.3)
 
 if changed:
-    json.dump(H, open(hist_f, "w"), ensure_ascii=False)
+    json.dump(H, open(hist_f, "w", encoding="utf-8"), ensure_ascii=False)
 wb_ok = (not ts_wb) or all(d in H["wb_dates"] for d in want)
 oz_ok = (not ts_oz) or all(d in H["oz_dates"] for d in want)
 print("DONE" if wb_ok and oz_ok else "PROGRESS — перезапусти")

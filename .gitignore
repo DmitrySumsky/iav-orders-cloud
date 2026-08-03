@@ -1,1 +1,9 @@
 __pycache__/
+# секреты локального прогона (в облаке их кладёт и подчищает сам workflow)
+api_keys.txt
+api_keys_extra.txt
+api_keys_merged.txt
+google_sa.json
+# результаты прогона
+reports/
+logs/

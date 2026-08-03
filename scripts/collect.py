@@ -82,13 +82,13 @@ def main():
 
     os.makedirs(a.state_dir, exist_ok=True)
     state_f = os.path.join(a.state_dir, f"{prefix}_{d_yest}.json")
-    S = json.load(open(state_f)) if os.path.exists(state_f) else {
+    S = json.load(open(state_f, encoding="utf-8")) if os.path.exists(state_f) else {
         "brand": a.brand, "yest": d_yest, "prev": d_prev,
         "has_wb": has_wb, "has_oz": has_oz,
         "wb_cards": None, "wb_funnel_done": 0, "wb_funnel": {},
         "wb_orders14": None, "wb_stocks": {},
         "ozon": None, "oz_stocks": None, "oz_orders14": None}
-    def save(): json.dump(S, open(state_f, "w"), ensure_ascii=False)
+    def save(): json.dump(S, open(state_f, "w", encoding="utf-8"), ensure_ascii=False)
 
     WB_H = {"Authorization": wb_token, "Content-Type": "application/json"}
     OZ_H = {"Client-Id": oz_id, "Api-Key": oz_key, "Content-Type": "application/json"}

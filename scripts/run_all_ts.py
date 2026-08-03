@@ -17,6 +17,11 @@ Env: BRANDS, SKIP_TG, HISTORY_DAYS (дефолт 8), TIME_BUDGET (для ста�
 """
 import json, os, re, subprocess, sys, time, urllib.request, urllib.parse
 
+# Консоль Windows по умолчанию cp1251: «×», «→», «✅» роняли бы прогон на печати.
+for _s in (sys.stdout, sys.stderr):
+    try: _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception: pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 KEYS = os.path.join(ROOT, "api_keys.txt")
@@ -34,7 +39,7 @@ for line in open(KEYS, encoding="utf-8"):
 
 def sa_valid():
     try:
-        return bool(json.load(open(SA)).get("client_email"))
+        return bool(json.load(open(SA, encoding="utf-8")).get("client_email"))
     except Exception:
         return False
 
@@ -78,6 +83,13 @@ def tg_send(chats, text):
             print(f"TG {cid}: не отправлено ({e})"); ok = False
     return ok
 
+# Windows-консоль по умолчанию cp1251: дочерний print("→"/"×") падал бы UnicodeEncodeError,
+# а разбор его вывода — UnicodeDecodeError. Явный utf-8 в обе стороны.
+CHILD_ENV = dict(os.environ, PYTHONIOENCODING="utf-8")
+def run(args, **kw):
+    return subprocess.run(args, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", env=CHILD_ENV, **kw)
+
 def tg_alert(text):
     """Служебное уведомление о сбое (не валит прогон, если само упало)."""
     tg_send(K.get("TELEGRAM_CHAT_ID", ""), text)
@@ -88,7 +100,7 @@ def run_until_done(args, max_runs=25, deadline_sec=1500):
     один бренд не должен съесть весь лимит джоба."""
     t0 = time.time()
     for i in range(max_runs):
-        r = subprocess.run(args, capture_output=True, text=True)
+        r = run(args)
         out = (r.stdout + r.stderr).strip()
         # показываем и начало вывода — по нему видно, какой шаг успел пройти
         if out: print(out if len(out) <= 2200 else out[:600] + "\n…\n" + out[-1600:], flush=True)
@@ -133,8 +145,8 @@ def process(brand):
     if not states: return "нет state"
     state_f = os.path.join(STATE, states[-1])
 
-    r = subprocess.run(["python3", f"{HERE}/build_excel.py", "--state", state_f,
-                        "--outdir", REPORTS], capture_output=True, text=True)
+    r = run(["python3", f"{HERE}/build_excel.py", "--state", state_f,
+                        "--outdir", REPORTS])
     print(r.stdout.strip() or r.stderr[-500:])
     if "VERIFY OK" not in r.stdout:
         st["Детали"] = "Excel не собрался"; return "excel"
@@ -143,9 +155,9 @@ def process(brand):
     sheet_id = K.get(f"{prefix}_GSHEET_ID", "")
     sheet_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit" if sheet_id else ""
     if sheet_id and sa_valid():
-        r = subprocess.run(["python3", f"{HERE}/push_gsheet.py", "--state", state_f,
+        r = run(["python3", f"{HERE}/push_gsheet.py", "--state", state_f,
                             "--history", os.path.join(STATE, f"history_{prefix}.json"),
-                            "--sa", SA, "--sheet-id", sheet_id], capture_output=True, text=True)
+                            "--sa", SA, "--sheet-id", sheet_id])
         print(r.stdout.strip() or r.stderr[-500:])
         if "VERIFY OK" not in r.stdout:
             # не валим бренд: TG с Excel важнее; таблица могла быть не расшарена на SA
@@ -165,12 +177,12 @@ def process(brand):
         args = ["python3", f"{HERE}/send_telegram.py", "--state", state_f, "--keys", KEYS,
                 "--file", xlsx]
         if sheet_url: args += ["--sheet-url", sheet_url]
-        r = subprocess.run(args, capture_output=True, text=True)
+        r = run(args)
         print(r.stdout.strip() or r.stderr[-500:])
         if "OK" not in r.stdout:
             st["Telegram"] = "❌"; return "telegram"
         st["Telegram"] = "✅"
-        open(sent_flag, "w").write("sent")
+        open(sent_flag, "w", encoding="utf-8").write("sent")
     return None
 
 brand_list = [b.strip() for b in BRANDS if b.strip()]
@@ -205,9 +217,8 @@ if K.get("SVOD_GSHEET_ID"):
     st = STATUS.setdefault("Свод «Общая»", {"Сбор данных": "—", "Google-таблица": "—",
                                             "Telegram": "—", "Детали": ""})
     if sa_valid():
-        r = subprocess.run(["python3", f"{HERE}/svod_report.py", "--keys", KEYS, "--sa", SA,
-                            "--state-dir", STATE],
-                           capture_output=True, text=True)
+        r = run(["python3", f"{HERE}/svod_report.py", "--keys", KEYS, "--sa", SA,
+                            "--state-dir", STATE])
         print((r.stdout + r.stderr).strip()[-1500:])
         if "DONE" not in r.stdout:
             failed["СВОД"] = "svod_report"
@@ -232,12 +243,12 @@ if K.get("SVOD_GSHEET_ID"):
             elif day and os.path.exists(sent_flag):
                 print("сводка уже отправлена за эту дату — пропуск"); st["Telegram"] = "✅ (ранее)"
             elif day and K.get("SVOD_TG_CHATS"):
-                r2 = subprocess.run(["python3", f"{HERE}/svod_telegram.py", "--summary", summary_f,
-                                     "--keys", KEYS], capture_output=True, text=True)
+                r2 = run(["python3", f"{HERE}/svod_telegram.py", "--summary", summary_f,
+                                     "--keys", KEYS])
                 print((r2.stdout + r2.stderr).strip()[-800:])
                 if r2.returncode == 0 and "OK" in r2.stdout:
                     st["Telegram"] = "✅"
-                    open(sent_flag, "w").write("sent")
+                    open(sent_flag, "w", encoding="utf-8").write("sent")
                 else:
                     st["Telegram"] = "❌"; failed["СВОД"] = "svod_telegram"
     else:
@@ -253,9 +264,8 @@ if K.get("PRICES_GSHEET_ID"):
         ids = [s.strip() for s in K["PRICES_GSHEET_ID"].split(",") if s.strip()]
         ok, filled = True, []
         for sid in ids:
-            r = subprocess.run(["python3", f"{HERE}/prices_update.py", "--keys", KEYS,
-                                "--sa", SA, "--sheet-id", sid],
-                               capture_output=True, text=True)
+            r = run(["python3", f"{HERE}/prices_update.py", "--keys", KEYS,
+                                "--sa", SA, "--sheet-id", sid])
             print((r.stdout + r.stderr).strip()[-1500:])
             if "DONE" not in r.stdout: ok = False
             filled += [l.strip() for l in r.stdout.splitlines() if "залито ячеек" in l]

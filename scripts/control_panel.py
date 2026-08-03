@@ -43,7 +43,7 @@ SEED = [
 
 def _auth(sa_file):
     import jwt
-    SA = json.load(open(sa_file)); now = int(time.time())
+    SA = json.load(open(sa_file, encoding="utf-8")); now = int(time.time())
     a = jwt.encode({"iss": SA["client_email"], "scope": "https://www.googleapis.com/auth/spreadsheets",
         "aud": "https://oauth2.googleapis.com/token", "iat": now, "exp": now + 3600},
         SA["private_key"], algorithm="RS256")

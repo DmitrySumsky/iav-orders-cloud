@@ -220,7 +220,7 @@ for hkey in ("wb", "oz"):
 
 # ---------- Google Sheets API ----------
 import jwt
-SA = json.load(open(a.sa))
+SA = json.load(open(a.sa, encoding="utf-8"))
 now = int(time.time())
 assertion = jwt.encode({"iss": SA["client_email"], "scope": "https://www.googleapis.com/auth/spreadsheets",
     "aud": "https://oauth2.googleapis.com/token", "iat": now, "exp": now + 3600},

@@ -26,7 +26,7 @@ p.add_argument("--sheet-id", required=True)
 p.add_argument("--history", default="", help="history_<PREFIX>.json для колонок прошлых дней в «Общее»")
 a = p.parse_args()
 
-S = json.load(open(a.state))
+S = json.load(open(a.state, encoding="utf-8"))
 MAP = load_map(os.path.dirname(os.path.abspath(a.state)), __import__("re").sub(r"[^A-Z0-9]", "", S["brand"].upper()))
 Y, P = S["yest"], S["prev"]
 ddmm = lambda iso: f"{iso[8:10]}.{iso[5:7]}"
@@ -76,7 +76,7 @@ for row in oz_rows:
 items = sorted(agg.items(), key=lambda kv: -kv[1]["y"])
 
 # ---------- Google API ----------
-SA = json.load(open(a.sa))
+SA = json.load(open(a.sa, encoding="utf-8"))
 now = int(time.time())
 assertion = jwt.encode({"iss": SA["client_email"], "scope": "https://www.googleapis.com/auth/spreadsheets",
     "aud": "https://oauth2.googleapis.com/token", "iat": now, "exp": now + 3600},
@@ -177,7 +177,7 @@ def push_sheet(title, header, total_row, data_rows, delta_cols, pct_cols, n_cols
 # история заказов по дням (для листов WB / Ozon / Общее)
 hist_dates, hist = [], {}
 if a.history and os.path.exists(a.history):
-    HF = json.load(open(a.history))
+    HF = json.load(open(a.history, encoding="utf-8"))
     hist = HF.get("data", {})
     all_dates = sorted(set(HF.get("wb_dates", [])) | set(HF.get("oz_dates", [])), reverse=True)
     hist_dates = [d for d in all_dates if d < P]

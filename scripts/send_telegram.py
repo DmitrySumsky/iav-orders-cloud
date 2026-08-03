@@ -22,6 +22,7 @@ p.add_argument("--chat-id", default="")
 p.add_argument("--file", default="")
 p.add_argument("--sheet-url", default="")
 p.add_argument("--no-send", action="store_true")  # только собрать картинку
+p.add_argument("--only-file", action="store_true")  # дослать только xlsx (картинка уже в чате)
 a = p.parse_args()
 
 K = {}
@@ -31,7 +32,7 @@ for line in open(a.keys, encoding="utf-8"):
         k, v = line.split("=", 1); K[k] = v.strip()
 TOK = K.get("TELEGRAM_BOT_TOKEN", "")
 
-S = json.load(open(a.state))
+S = json.load(open(a.state, encoding="utf-8"))
 MAP = load_map(os.path.dirname(os.path.abspath(a.state)), __import__("re").sub(r"[^A-Z0-9]", "", S["brand"].upper()))
 Y, P = S["yest"], S["prev"]
 ddmm = lambda iso: f"{iso[8:10]}.{iso[5:7]}"
@@ -159,13 +160,14 @@ caption = f"{BRAND}: {wb_y + oz_y:,} заказов за {ddmm(Y)} ({(wb_y+oz_y)
 if a.sheet_url:
     caption += f"\nТаблица: {a.sheet_url}"
 for cid, thr in TARGETS:
-    fields = {"chat_id": cid, "caption": caption}
-    if thr: fields["message_thread_id"] = thr
-    r = multipart(f"https://api.telegram.org/bot{TOK}/sendPhoto", fields, "photo", img_path, "image/png")
-    print(f"photo → {cid}{':'+thr if thr else ''}:", "OK" if r.get("ok") else r)
+    if not a.only_file:
+        fields = {"chat_id": cid, "caption": caption}
+        if thr: fields["message_thread_id"] = thr
+        r = multipart(f"https://api.telegram.org/bot{TOK}/sendPhoto", fields, "photo", img_path, "image/png")
+        print(f"photo -> {cid}{':'+thr if thr else ''}:", "OK" if r.get("ok") else r)
     if a.file and os.path.exists(a.file):
         fields = {"chat_id": cid}
         if thr: fields["message_thread_id"] = thr
         r = multipart(f"https://api.telegram.org/bot{TOK}/sendDocument", fields, "document", a.file,
                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        print(f"file → {cid}{':'+thr if thr else ''}:", "OK" if r.get("ok") else r)
+        print(f"file -> {cid}{':'+thr if thr else ''}:", "OK" if r.get("ok") else r)

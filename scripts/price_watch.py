@@ -286,7 +286,7 @@ def load_keys(paths):
 def token_of(sa_path, tries=4):
     """Токен сервисного аккаунта. С ретраем: разовый таймаут на выдаче токена
     иначе убивает весь часовой прогон ещё до первого запроса к таблице."""
-    SA = json.load(open(sa_path)); now = int(time.time())
+    SA = json.load(open(sa_path, encoding="utf-8")); now = int(time.time())
     a_ = jwt.encode({"iss": SA["client_email"], "scope": "https://www.googleapis.com/auth/spreadsheets",
                      "aud": "https://oauth2.googleapis.com/token", "iat": now, "exp": now + 3600},
                     SA["private_key"], algorithm="RS256")

@@ -27,7 +27,7 @@ p.add_argument("--state", required=True)
 p.add_argument("--outdir", required=True)
 a = p.parse_args()
 
-S = json.load(open(a.state))
+S = json.load(open(a.state, encoding="utf-8"))
 MAP = load_map(os.path.dirname(os.path.abspath(a.state)), __import__("re").sub(r"[^A-Z0-9]", "", S["brand"].upper()))
 Y, P = S["yest"], S["prev"]
 BRAND = S["brand"]

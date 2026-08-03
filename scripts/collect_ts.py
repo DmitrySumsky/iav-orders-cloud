@@ -196,7 +196,7 @@ def main():
     S = None
     if os.path.exists(state_f):
         try:
-            S = json.load(open(state_f))
+            S = json.load(open(state_f, encoding="utf-8"))
             if not isinstance(S, dict) or "brand" not in S:
                 print(f"ВНИМАНИЕ: {state_f} повреждён/чужой — пересоздаю"); S = None
         except Exception:
@@ -440,7 +440,7 @@ def main():
             print(f"{'WB' if kind == 'wb' else 'Ozon'} {day}: источник просел, "
                   f"вернул {back} шт из прошлого прогона")
 
-    json.dump(S, open(state_f, "w"), ensure_ascii=False)
+    json.dump(S, open(state_f, "w", encoding="utf-8"), ensure_ascii=False)
     if a.compare and cmp_report:
         print(f"--- СВЕРКА: {len(cmp_report)} расхождений ---")
         for line in cmp_report[:40]: print("  " + line)

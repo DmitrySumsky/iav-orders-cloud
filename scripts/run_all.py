@@ -90,7 +90,7 @@ for idx, brand in enumerate(brand_list):
         r = subprocess.run(args, capture_output=True, text=True)
         print(r.stdout.strip() or r.stderr[-500:])
         if "OK" in r.stdout:
-            open(sent_flag, "w").write("sent")
+            open(sent_flag, "w", encoding="utf-8").write("sent")
 
 print("\nИТОГ:", "все бренды OK" if not failed else f"ошибки: {failed}")
 sys.exit(1 if failed else 0)

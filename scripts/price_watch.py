@@ -1,7 +1,20 @@
 #!/usr/bin/env python3
-"""PRICE WATCH v1.1.0 — 06.08.2026. Часовой монитор «мы стали дороже конкурентов».
+"""PRICE WATCH v1.2.0 — 06.08.2026. Часовой монитор «мы стали дороже конкурентов».
 
 История версий (новое сверху, старое не переписывать):
+
+v1.2.0 — 06.08.2026
+  «ПОВТОРЫ НЕ ТОЛЬКО ПО РОСТУ РАЗРЫВА, НО И ТРИ РАЗА В ДЕНЬ ЦЕЛИКОМ» — правка
+  пользователя по итогам v1.1.0. Анти-спам хорош, пока сигнал приходит; но
+  позиция, о которой уведомили утром и которая весь день висит дороже рынка,
+  из чата исчезала — и «тихо» читалось как «всё в порядке».
+  • Настройка «Полный отчёт в часы» (по умолчанию 9, 13, 16): в эти часы уходит
+    ПОЛНАЯ картина по бренду, а не только новое, — как ручной `--force`, но по
+    расписанию. Состояние при этом обновляется, поэтому обычные часы между
+    сводками работают по-прежнему (повтор только при росте на REALERT_STEP п.п.).
+  • Сводка уходит и когда сигналов нет: «✅ Все позиции в рамках порога». Это и
+    есть контроль — молчание монитора перестало быть неотличимым от поломки.
+  • Рабочее окно по умолчанию 9–16 МСК (было 8–17), крон `0 6-13 * * *`.
 
 v1.1.0 — 06.08.2026
   СООБЩЕНИЕ БЫЛО НЕЧИТАЕМЫМ — голосовые Артура 06.08.2026: «очень мало
@@ -69,8 +82,9 @@ MSK = timezone(timedelta(hours=3))
 COLS_HEAD = ["Артикул", "Товар (группа)", "Бренд", "Наша цена"]
 COLS_TAIL = ["Мин. конкурент", "Цена мин.", "% к мин.", "Группа мин.",
              "Дешевле нас", "Статус", "Обновлено", "% при уведомлении"]
-DEFAULTS = {"Порог, %": "5", "Получатели TG": "", "Часы работы (МСК)": "8-17",
+DEFAULTS = {"Порог, %": "5", "Получатели TG": "", "Часы работы (МСК)": "9-16",
             "Дни недели": "пн-пт", "Срочный порог, %": "",
+            "Полный отчёт в часы": "9, 13, 16",
             "Включён": "да", "Наши бренды": "NATURI, SUNSHINE, Health Form, 4ME, VEXOR, ORZAX",
             "Якоря (группа А)": "Healthis, VitaMeal, PWR",
             "Группа Б (не якорные)": "Miosuperfood, Miopharm, MISHIDO, GLS",
@@ -90,7 +104,11 @@ NOTE = ("порог работает в обе стороны: на стольк
         "(теряем продажи) или дешевле его же (отдаём маржу). «Дни недели»: пн-пт, "
         "пн-вс или список через запятую. «Срочный порог, %»: пусто = вне рабочего "
         "окна молчим; заполнено = и ночью, и в выходной придёт то, где разрыв "
-        "дорос до этого значения. «Якоря (группа А)» — конкуренты, по которым "
+        "дорос до этого значения. «Полный отчёт в часы»: в перечисленные часы "
+        "приходит ВСЯ текущая картина по бренду, а не только новое — для "
+        "контроля; если всё в рамках порога, придёт короткое «всё в порядке». "
+        "Пусто = сводок нет, только новые сигналы. "
+        "«Якоря (группа А)» — конкуренты, по которым "
         "работает ценовое правило (стоять на 15–20 % ниже); «Группа Б» — "
         "конкуренты второго эшелона: они остаются в таблице и в сообщениях, но "
         "помечены отдельно, и настройкой «Сигнал без группы Б» = да их можно "
@@ -739,6 +757,18 @@ def main():
         print(f"Сейчас {when} — вне окна, но задан срочный порог {urgent_pct}%: "
               "шлём только резкие отрывы")
 
+    # v1.2.0. Часы полной сводки: анти-спам молчит по позиции, о которой уже
+    # уведомили, и висящая весь день «дороже рынка» пропадала из чата — тишина
+    # читалась как «всё хорошо». В эти часы уходит вся текущая картина по бренду
+    # (то же, что ручной --force), включая «всё в порядке», если сигналов нет.
+    # Вне рабочего окна сводок нет: там работает только срочный порог.
+    digest_hours = {int(x) for x in re.findall(r"\d+", cfg["Полный отчёт в часы"])}
+    digest = a.force or (datetime.now(MSK).hour in digest_hours and not urgent_only)
+    if digest:
+        print("полная сводка: "
+              + ("запрошена ключом --force" if a.force
+                 else f"час {datetime.now(MSK).hour}:00 в списке {sorted(digest_hours)}"))
+
     # ----- товарные группы с первого листа книги (WB) -----
     wb_title = sheets[0]["title"]
     q = urllib.parse.quote("'" + wb_title.replace("'", "''") + "'")
@@ -871,7 +901,7 @@ def main():
                 grew = was_pts is not None and (
                     st["d_min"] >= was_pts + REALERT_STEP if st["status"] == "дороже"
                     else st["d_min"] <= was_pts - REALERT_STEP)
-                if (a.force or not notified or grew) and \
+                if (digest or not notified or grew) and \
                         (not urgent_only or abs(st["d_min"]) >= urgent_pct):
                     alerts.append((key, st, "рост" if (grew and notified) else "новое"))
             elif st["status"] == "ок" and notified:
@@ -920,7 +950,10 @@ def main():
         under = sum(1 for s in scope if s["status"] == "дешевле")
         brands = sorted({s["brand"] for s in scope})
         head_brand = (brands[0] if len(brands) == 1 else ", ".join(brands)[:60])
-        lines.append(f"📊 <b>{MP_LABEL} · {esc(head_brand)} — {now_s} МСК</b>")
+        # v1.2.0. «сводка» в шапке: читатель должен понимать, что это контрольный
+        # срез за час X, а не «вот прямо сейчас всё это стало плохо»
+        mark = " · сводка" if digest else ""
+        lines.append(f"📊 <b>{MP_LABEL} · {esc(head_brand)} — {now_s} МСК{mark}</b>")
         lines.append(f"дороже: {over} из {len(scope)} · дешевле рынка: {under} "
                      f"· порог {thr_pct}%")
         lines.append("")
@@ -958,6 +991,11 @@ def main():
             more = f" и ещё {len(part_recovered) - 6}" if len(part_recovered) > 6 else ""
             lines.append(f"✅ Вернулись к рынку: {len(part_recovered)} — {names}{more}")
             keys |= {key for key, *_ in part_recovered}
+            lines.append("")
+        if not (up or down or part_recovered):
+            # сводка без единого сигнала — тоже сообщение: молчание монитора
+            # иначе неотличимо от его поломки, а это и есть «для контроля»
+            lines.append(f"✅ Все позиции в рамках порога — {len(scope)} шт")
             lines.append("")
         lines.append(f"<a href=\"https://docs.google.com/spreadsheets/d/{a.sheet_id}/edit\">"
                      f"Таблица цен {MP_LABEL}</a>")
@@ -1024,10 +1062,14 @@ def main():
         head_brand = (brands[0] if len(brands) == 1 else ", ".join(brands)[:60])
         over = sum(1 for s in scope if s["status"] == "дороже")
         under = sum(1 for s in scope if s["status"] == "дешевле")
-        lines.append(f"📊 <b>{MP_LABEL} · {esc(head_brand)} — цены на {now_s} МСК</b>")
+        lines.append(f"📊 <b>{MP_LABEL} · {esc(head_brand)} — цены на {now_s} МСК"
+                     f"{' · сводка' if digest else ''}</b>")
         lines.append(f"дороже конкурентов: {over} из {len(scope)} · "
                      f"дешевле рынка: {under} · порог {thr_pct}%")
         lines.append("")
+        if not part_alerts and not part_recovered:
+            lines.append(f"✅ Все позиции в рамках порога — {len(scope)} шт")
+            lines.append("")
         section("⚠️ <b>СТАЛИ ДОРОЖЕ</b> — {n} позиций по {g} товарам",
                 [x for x in part_alerts if x[1]["status"] == "дороже"], 1)
         section("💰 <b>СИЛЬНО ДЕШЕВЛЕ ВСЕХ</b> — {n} позиций по {g} товарам, "
@@ -1083,7 +1125,7 @@ def main():
         return True
 
     sent_keys = set()
-    if alerts or recovered:
+    if alerts or recovered or digest:
         # раскладываем сигналы по адресатам: у каждого чата своё сообщение и
         # свои счётчики, чтобы бренду не прилетала чужая статистика
         # ключ маршрута — адресат; в тестовом режиме адресат у всех один, поэтому
@@ -1091,18 +1133,31 @@ def main():
         def route_key(brand):
             return brand.strip() if test_targets else tuple(targets_for(brand))
 
-        routes = {}
+        # v1.2.0. Состав брендов маршрута ведём отдельно: в час сводки маршрут
+        # может не иметь НИ ОДНОГО сигнала, и вывести бренд из списка сигналов
+        # (как раньше) уже нельзя — сообщение осталось бы без охвата и без шапки
+        routes, route_brands = {}, {}
+
+        def route_add(brand):
+            k = route_key(brand)
+            routes.setdefault(k, {"a": [], "r": []})
+            route_brands.setdefault(k, set()).add(brand)
+            return k
+
         for item in alerts:
-            routes.setdefault(route_key(item[1]["brand"]), {"a": [], "r": []})["a"].append(item)
+            routes[route_add(item[1]["brand"])]["a"].append(item)
         for item in recovered:
-            routes.setdefault(route_key(item[1]["brand"]), {"a": [], "r": []})["r"].append(item)
+            routes[route_add(item[1]["brand"])]["r"].append(item)
+        if digest:
+            # сводку получает каждый бренд книги, даже тот, у кого всё в порядке
+            for brand in sorted({s["brand"] for s in cur.values()}):
+                route_add(brand)
 
         def addr(t):
             return ", ".join(c + (":" + th if th else "") for c, th in t) or "—"
 
         for key, data in routes.items():
-            brands_here = {s["brand"] for _, s, *_ in data["a"] + data["r"]}
-            scope = [s for s in cur.values() if s["brand"] in brands_here]
+            scope = [s for s in cur.values() if s["brand"] in route_brands[key]]
             build = build_compact if compact else build_message
             text, keys, cont_head = build(data["a"], data["r"], scope)
             if test_targets:

@@ -1,5 +1,37 @@
 #!/usr/bin/env python3
-"""Часовой монитор «мы стали дороже конкурентов» по таблице «Аналитика цен».
+"""PRICE WATCH v1.1.0 — 06.08.2026. Часовой монитор «мы стали дороже конкурентов».
+
+История версий (новое сверху, старое не переписывать):
+
+v1.1.0 — 06.08.2026
+  СООБЩЕНИЕ БЫЛО НЕЧИТАЕМЫМ — голосовые Артура 06.08.2026: «очень мало
+  информативная штука», «чтобы выглядело просто: проверь омегу и артикул, без
+  лишней информации, чтобы глаз не нагружать». Главное, за чем следят, — что мы
+  не стоим дороже конкурентов; «сильно дешевле» оставлено (менеджер может
+  ошибиться и уронить цену).
+  • Компактный формат сообщения (настройка «Формат сообщения», по умолчанию
+    «компактный»): строка на позицию «маркер +X% · товар · артикул · наша цена
+    (мин N ₽)», отсортировано от самого большого превышения. Убраны шапки
+    товарных групп, строка «мин. … конкурентов N», строка «топ: …» и «% к якорю»
+    — они и составляли основную массу текста. Прежний вид доступен настройкой
+    «подробный».
+  • Маркер остроты 🔴 ≥15 % / 🟠 ≥8 % / 🟡 ниже — «реально проблемный артикул»
+    виден без чтения чисел.
+  • В листе «Мониторинг цен» ячейка АРТИКУЛА у позиций «дороже» красится
+    отдельно от строки: тёмно-красная с белым жирным при ≥15 %, красная при
+    меньшем разрыве (просьба Артура «перекрашивал ячейку в красный по тому
+    артикулу, который нас беспокоит»).
+  • Крон переведён на почасовой прогон 8:00–20:00 МСК (`price-watch.yml`),
+    рабочее окно по-прежнему решает лист.
+  • `send_chunked` режет длинный блок по строкам: в компактном виде весь список
+    позиций — один блок, и у бренда с двумя десятками сигналов он перерастал
+    лимит Telegram целиком (в подробном формате блоком была товарная группа).
+
+v1.0.0 — 28.07–31.07.2026
+  Исходный монитор: сравнение внутри товарной группы, порог в обе стороны,
+  гистерезис и анти-спам по п.п., группы конкурентов А/Б, колонки конкурентов
+  поимённо с артикулом в ячейке, разбивка рассылки по брендам, срочный порог
+  вне рабочего окна.
 
 Живая цена берётся НЕ из MPStats (там только дневной срез), а из публичного
 card.wb.ru: `sizes[0].price.product / 100` = цена карточки, цена с WB-Кошельком
@@ -45,6 +77,7 @@ DEFAULTS = {"Порог, %": "5", "Получатели TG": "", "Часы ра�
             "Колонки конкурентов": "Healthis, VitaMeal, PWR, Miosuperfood, GLS",
             "Сигнал без группы Б": "нет",
             "Разбивать по брендам": "нет", "Чаты по брендам": "",
+            "Формат сообщения": "компактный",
             "Тест: всё в чат": ""}
 DAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
 # Раскладка листа СЧИТАЕТСЯ от числа настроек, а не забита числами: иначе новая
@@ -66,6 +99,10 @@ NOTE = ("порог работает в обе стороны: на стольк
         "можно коротко: Miosuperfood поймает «Miosuperfood (Миофарм)»); конкурент, "
         "которого в этой книге нет ни разу, колонку не получает. В ячейке "
         "конкурента рядом с ценой стоит его артикул — копируйте прямо из ячейки. "
+        "«Формат сообщения»: компактный (по умолчанию) — строка на позицию "
+        "«маркер +X% · товар · артикул · наша цена (мин N ₽)», самое большое "
+        "превышение сверху; подробный — прежний вид с разбором по товарным "
+        "группам, топ-конкурентами и процентом к якорю. "
         "«Чаты по брендам»: "
         "NATURI=-100…:5, SUNSHINE=-100…:7 — пусто = берётся из ключей отчёта. "
         "«Тест: всё в чат» — репетиция рассылки: разбивка по брендам включается "
@@ -102,7 +139,31 @@ BANDS_UP = [(15.0, "#E06666", True), (8.0, "#EA9999", False),
             (3.0, "#F4CCCC", False), (0.0, "#FCE8E6", False)]
 BANDS_DOWN = [(20.0, "#93C47D", True), (12.0, "#B6D7A8", False),
               (0.0, "#D9EAD3", False)]
-WHITE, GRAY = "#FFFFFF", "#EFEFEF"
+WHITE, GRAY, BLACK = "#FFFFFF", "#EFEFEF", "#000000"
+# v1.1.0. Ячейка АРТИКУЛА у позиций «дороже» красится отдельно от строки: строка
+# показывает остроту фоном, а глазу нужен один якорь, за который цепляться, —
+# сам артикул (просьба Артура 06.08.2026). Формат: (граница %, фон, текст, жирный).
+ART_BANDS = [(15.0, "#CC0000", WHITE, True), (0.0, "#E06666", BLACK, True)]
+# Маркер остроты в сообщении: «реально проблемный» видно до чтения чисел
+SEV_MARKS = [(15.0, "🔴"), (8.0, "🟠"), (0.0, "🟡")]
+
+
+def sev_mark(d_min):
+    """v1.1.0. Кружок остроты по превышению над минимумом конкурентов."""
+    for edge, mark in SEV_MARKS:
+        if d_min >= edge:
+            return mark
+    return SEV_MARKS[-1][1]
+
+
+def art_style(s):
+    """v1.1.0. Оформление ячейки артикула: не «дороже» — как вся строка (None)."""
+    if s["status"] != "дороже" or not isinstance(s["d_min"], (int, float)):
+        return None
+    for edge, bg, fg, bold in ART_BANDS:
+        if s["d_min"] >= edge:
+            return bg, fg, bold
+    return None
 
 esc = lambda s: html.escape(str(s), quote=True)
 
@@ -191,7 +252,7 @@ def row_style(s):
     return WHITE, False
 
 
-def decorate(sheet_id, tok, gid, styles, need_rows, has_alerts, L):
+def decorate(sheet_id, tok, gid, styles, art_styles, need_rows, has_alerts, L):
     """Оформление листа: заливка строк по остроте, форматы чисел, ширины.
 
     Цвета считаются здесь и кладутся статикой, а НЕ условным форматированием:
@@ -211,10 +272,14 @@ def decorate(sheet_id, tok, gid, styles, need_rows, has_alerts, L):
 
     body = {"startRowIndex": FIRST_DATA_ROW - 1, "endRowIndex": need_rows,
             "startColumnIndex": 0, "endColumnIndex": len(L)}
+    # цвет текста тоже сбрасываем: у бывшей «горячей» ячейки артикула он белый,
+    # и без сброса белые цифры остались бы на белом фоне следующего прогона
     reqs.append({"repeatCell": {"range": {"sheetId": gid, **body},
         "cell": {"userEnteredFormat": {"backgroundColor": rgb(WHITE),
-                                       "textFormat": {"bold": False}}},
-        "fields": "userEnteredFormat(backgroundColor,textFormat.bold)"}})
+                                       "textFormat": {"bold": False,
+                                                      "foregroundColor": rgb(BLACK)}}},
+        "fields": "userEnteredFormat(backgroundColor,"
+                  "textFormat.bold,textFormat.foregroundColor)"}})
 
     band_start, band_style, i = 0, None, 0
     for i, st in enumerate(styles):
@@ -227,6 +292,17 @@ def decorate(sheet_id, tok, gid, styles, need_rows, has_alerts, L):
     if styles and band_style is not None:
         reqs.append(paint(gid, FIRST_DATA_ROW - 1 + band_start,
                           FIRST_DATA_ROW - 1 + len(styles), band_style, L))
+
+    # v1.1.0. Ячейка артикула поверх строки. Строки уже отсортированы по остроте,
+    # поэтому «дороже» идут подряд и вся покраска укладывается в 1–2 запроса.
+    band_start, band_style = 0, None
+    for i, st in enumerate(art_styles + [None]):
+        if st == band_style:
+            continue
+        if band_style is not None:
+            reqs.append(paint_art(gid, FIRST_DATA_ROW - 1 + band_start,
+                                  FIRST_DATA_ROW - 1 + i, band_style))
+        band_start, band_style = i, st
 
     # Рублёвый формат — только «наша цена» и «цена мин.»: в колонках конкурентов
     # с 31.07.2026 лежит текст «цена · артикул», числовой формат к нему неприменим
@@ -252,6 +328,19 @@ def decorate(sheet_id, tok, gid, styles, need_rows, has_alerts, L):
         "fields": "userEnteredFormat(backgroundColor,textFormat.bold)"}})
 
     api(sheet_id + ":batchUpdate", tok, "POST", {"requests": reqs})
+
+
+def paint_art(gid, r0, r1, style):
+    """v1.1.0. Заливка ячейки артикула (колонка A) на диапазоне строк."""
+    bg, fg, bold = style
+    return {"repeatCell": {
+        "range": {"sheetId": gid, "startRowIndex": r0, "endRowIndex": r1,
+                  "startColumnIndex": 0, "endColumnIndex": 1},
+        "cell": {"userEnteredFormat": {"backgroundColor": rgb(bg),
+                                       "textFormat": {"bold": bold,
+                                                      "foregroundColor": rgb(fg)}}},
+        "fields": "userEnteredFormat(backgroundColor,"
+                  "textFormat.bold,textFormat.foregroundColor)"}}
 
 
 def paint(gid, r0, r1, style, L):
@@ -617,6 +706,8 @@ def main():
     # Репетиция перед боевой рассылкой: разбивка считается включённой, но всё
     # уходит в один тестовый чат с пометкой, куда сообщение пойдёт в бою.
     # Состояние не помечается — после теста боевой прогон шлёт всё как в первый раз.
+    # v1.1.0. Компактный вид по умолчанию; «подробный» в ячейке возвращает прежний
+    compact = not cfg["Формат сообщения"].strip().lower().startswith("подроб")
     test_targets = parse_targets(cfg["Тест: всё в чат"])
     if test_targets:
         split_brands = True
@@ -627,6 +718,7 @@ def main():
             b, dst = part.split("=", 1)
             if b.strip() and dst.strip():
                 route_map[b.strip().lower()] = parse_targets(dst)
+    print(f"формат сообщения: {'компактный' if compact else 'подробный'}")
     print(f"рассылка: {'по брендам' if split_brands else 'общая'}"
           + (f", переопределений в листе {len(route_map)}" if route_map else "")
           + (f", ТЕСТ: всё в {cfg['Тест: всё в чат'].strip()}" if test_targets else ""))
@@ -813,6 +905,64 @@ def main():
         raw = K.get(re.sub(r"[^A-Z0-9]", "", brand.upper()) + "_TG_CHATS", "")
         return parse_targets(raw) if raw else default_targets
 
+    def build_compact(part_alerts, part_recovered, scope):
+        """v1.1.0. Одна строка на позицию, самое большое превышение сверху.
+
+        Формат родился из голосовых Артура 06.08.2026: «чтобы выглядело просто —
+        проверь омегу и артикул, без лишней информации». Поэтому в строке ровно
+        то, по чему принимают решение: насколько мы дороже (и маркер остроты),
+        что за товар, какой артикул и от какой цены отталкиваться. Разбор по
+        товарным группам, топ-конкуренты и процент к якорю остались в подробном
+        формате и в самом листе.
+        """
+        lines, keys = [], set()
+        over = sum(1 for s in scope if s["status"] == "дороже")
+        under = sum(1 for s in scope if s["status"] == "дешевле")
+        brands = sorted({s["brand"] for s in scope})
+        head_brand = (brands[0] if len(brands) == 1 else ", ".join(brands)[:60])
+        lines.append(f"📊 <b>{MP_LABEL} · {esc(head_brand)} — {now_s} МСК</b>")
+        lines.append(f"дороже: {over} из {len(scope)} · дешевле рынка: {under} "
+                     f"· порог {thr_pct}%")
+        lines.append("")
+
+        def row(s, key, kind, mark):
+            # артикул моноширинным: тап в Telegram = «скопировать», дальше поиск
+            # карточки на WB (тот же приём, что в подробном формате)
+            url = f"https://www.wildberries.ru/catalog/{key[0]}/detail.aspx"
+            grew = "📈" if kind == "рост" else ""
+            top = " ‼️" if s["top"] else ""
+            keys.add(key)
+            return (f"{mark} <b>{s['d_min']:+}%</b> "
+                    f"<a href=\"{url}\">{esc(s['group'])}</a> "
+                    f"<code>{key[0]}</code> {s['price']} ₽ "
+                    f"(мин {s['min']} ₽){top}{grew}")
+
+        up = sorted([x for x in part_alerts if x[1]["status"] == "дороже"],
+                    key=lambda x: -x[1]["d_min"])
+        if up:
+            lines.append(f"<b>ПРОВЕРЬ ЦЕНУ — {len(up)}</b>")
+            lines += [row(s, key, kind, sev_mark(s["d_min"])) for key, s, kind in up]
+            lines.append("")
+        # «сильно дешевле» оставлено сознательно: Артур сначала предложил убрать,
+        # тут же передумал — менеджер может ошибиться и уронить цену (голосовое 3)
+        down = sorted([x for x in part_alerts if x[1]["status"] == "дешевле"],
+                      key=lambda x: x[1]["d_min"])
+        if down:
+            lines.append(f"<b>ДЕШЕВЛЕ ВСЕХ — {len(down)}</b>")
+            lines += [row(s, key, kind, "💰") for key, s, kind in down]
+            lines.append("")
+        if part_recovered:
+            # возврат к рынку — новостью, а не списком: действий он не требует
+            names = ", ".join(f"{esc(s['group'])} <code>{key[0]}</code>"
+                              for key, s, _ in part_recovered[:6])
+            more = f" и ещё {len(part_recovered) - 6}" if len(part_recovered) > 6 else ""
+            lines.append(f"✅ Вернулись к рынку: {len(part_recovered)} — {names}{more}")
+            keys |= {key for key, *_ in part_recovered}
+            lines.append("")
+        lines.append(f"<a href=\"https://docs.google.com/spreadsheets/d/{a.sheet_id}/edit\">"
+                     f"Таблица цен {MP_LABEL}</a>")
+        return "\n".join(lines), keys, f"📊 <b>{MP_LABEL} · {esc(head_brand)}</b>"
+
     def build_message(part_alerts, part_recovered, scope):
         """Текст для одного адресата + ключи, которые в него вошли, + короткая
         шапка для продолжений (длинное сообщение уходит несколькими)."""
@@ -896,9 +1046,26 @@ def main():
         return "\n".join(lines), keys, f"📊 <b>{MP_LABEL} · {esc(head_brand)}</b>"
 
     def send_chunked(targets, text, cont_head=""):
-        chunks, buf = [], ""      # лимит Telegram — 4096 символов на сообщение
+        LIM = 3500                # лимит Telegram — 4096 символов на сообщение
+        chunks, buf = [], ""
+        # v1.1.0. Блок сам может не влезть: в компактном формате весь список
+        # позиций — ОДИН блок без пустых строк, и у большого бренда он перерастал
+        # лимит целиком (в подробном формате блоком была товарная группа, всегда
+        # короткая). Поэтому длинный блок дополнительно режется по строкам.
+        blocks = []
         for block in text.split("\n\n"):
-            if buf and len(buf) + len(block) + 2 > 3500:
+            if len(block) <= LIM:
+                blocks.append(block); continue
+            part = ""
+            for line in block.split("\n"):
+                if part and len(part) + len(line) + 1 > LIM:
+                    blocks.append(part); part = line
+                else:
+                    part = (part + "\n" + line) if part else line
+            if part:
+                blocks.append(part)
+        for block in blocks:
+            if buf and len(buf) + len(block) + 2 > LIM:
                 chunks.append(buf); buf = block
             else:
                 buf = (buf + "\n\n" + block) if buf else block
@@ -936,7 +1103,8 @@ def main():
         for key, data in routes.items():
             brands_here = {s["brand"] for _, s, *_ in data["a"] + data["r"]}
             scope = [s for s in cur.values() if s["brand"] in brands_here]
-            text, keys, cont_head = build_message(data["a"], data["r"], scope)
+            build = build_compact if compact else build_message
+            text, keys, cont_head = build(data["a"], data["r"], scope)
             if test_targets:
                 targets, real = list(test_targets), targets_for(key)
                 text = (f"🧪 <b>ТЕСТ рассылки.</b> Бренд <b>{html.escape(key)}</b>, "
@@ -1014,7 +1182,7 @@ def main():
         "data": [{"range": f"'{MON_TITLE}'!A{SUMMARY_ROW}", "values": [["Сейчас", summary]]},
                  {"range": f"'{MON_TITLE}'!A{FIRST_DATA_ROW}", "values": out}]})
     decorate(a.sheet_id, tok, gid, [row_style(s) for _, s in order],
-             need_rows, bool(total_over), L)
+             [art_style(s) for _, s in order], need_rows, bool(total_over), L)
     print(f"лист «{MON_TITLE}»: записано {len(out)} строк, наверху — {out[0][1] if out else '—'}")
     print("DONE")
 

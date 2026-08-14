@@ -57,10 +57,15 @@ jobs:
           DRY: ${{ github.event.inputs.dry_run }}
           FORCE: ${{ github.event.inputs.force }}
         run: |
-          # PRICES_GSHEET_ID — список таблиц через запятую; мониторим те, где
-          # в группах есть конкуренты (лист Ozon состоит из одних наших SKU)
-          IDS=$(grep -h '^PRICES_GSHEET_ID=' api_keys.txt | tail -1 | cut -d= -f2)
-          IDS=${IDS:-$(echo "")}
+          # Книги монитора отвязаны от книг ежедневного обновления цен
+          # (v2.1.0, 14.08.2026): рабочая книга контроля — «Анализ конкурентов
+          # (цены) все бренды», свои колонки дат она ведёт сама, и prices_update
+          # ей не нужен. PRICE_WATCH_SHEETS пусто — работаем по PRICES_GSHEET_ID,
+          # как раньше.
+          IDS=$(grep -h '^PRICE_WATCH_SHEETS=' api_keys.txt | tail -1 | cut -d= -f2)
+          if [ -z "$IDS" ]; then
+            IDS=$(grep -h '^PRICES_GSHEET_ID=' api_keys.txt | tail -1 | cut -d= -f2)
+          fi
           rc=0
           for id in $(echo "$IDS" | tr ',' ' '); do
             echo "=== таблица $id ==="

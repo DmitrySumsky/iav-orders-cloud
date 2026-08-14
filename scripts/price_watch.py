@@ -1,7 +1,30 @@
 #!/usr/bin/env python3
-"""PRICE WATCH v2.0.0 — 14.08.2026. Монитор цен: событие по конкретному конкуренту.
+"""PRICE WATCH v2.1.0 — 14.08.2026. Монитор цен: событие по конкретному конкуренту.
 
 История версий (новое сверху, старое не переписывать):
+
+v2.1.0 — 14.08.2026
+  «ПЕРЕЙДЁМ НА КОНТРОЛЬ ПО ЭТОЙ ТАБЛИЦЕ, КОНТРОЛИРУЕМ ТОЛЬКО ЖЁЛТЫХ» — решение
+  пользователя сразу после v2.0.0. Рабочей стала книга «Анализ конкурентов
+  (цены) все бренды», лист «Цены»: там строка = КАРТОЧКА конкурента, а не бренд,
+  и менеджер жёлтой заливкой в колонке «Бренд конкурента» сам отмечает, за кем
+  следим (254 карточки из 686; наши бренды выделены своими цветами).
+  • Наблюдение задаётся РАЗМЕТКОЙ КНИГИ, а не списком имён в настройках: цвет
+    ячейки бренда читается вместе со значениями, жёлтая = под контролем. Покрасил
+    менеджер новую строку — она под наблюдением со следующего прогона, без кода.
+  • Событие и состояние теперь по КАРТОЧКЕ (группа × артикул конкурента): у
+    одного бренда в группе бывает несколько карточек с разной ценой, и «VitaMeal
+    упал» без артикула нечего проверять.
+  • Фасовка входит в ключ группы (колонка «Капсул»): «Magnesium Chelate 120» и
+    «…240» — разные рынки, сравнивать их между собой нельзя.
+  • Свои бренды опознаются как конкуренты — по префиксу («Sunshine Nutrition»,
+    «4Me Nutrition» в новой книге против «SUNSHINE», «4ME» в настройке), иначе
+    наши же карточки попали бы в наблюдение.
+  • Книга монитора отвязана от книг ежедневного обновления цен: свой ключ
+    PRICE_WATCH_SHEETS (пусто = прежний PRICES_GSHEET_ID). Иначе новая книга
+    попала бы под prices_update, который ведёт свои колонки дат.
+  • Разметки нет вовсе (старые книги) — работает прежний путь v2.0.0 по именам
+    брендов из «Конкуренты под наблюдением» / «Колонки конкурентов».
 
 v2.0.0 — 14.08.2026
   «ЭТО КАША, Я УЖЕ НЕ СМОТРЮ» — голосовое Артура 14.08.2026. Прежний монитор
@@ -270,6 +293,47 @@ def comp_cell(pa):
         return ""
     price, art = pa
     return f"{price} ₽ · {art}"
+
+
+def is_watch_color(hexcolor):
+    """v2.1.0. Жёлтая заливка ячейки бренда = «эту карточку контролируем».
+
+    Оттенок задаёт менеджер руками, поэтому не сравниваем с одним #FFFF00, а
+    берём жёлтую гамму: красный и зелёный высокие и близки, синий заметно ниже.
+    Белый, серый и «фирменные» цвета наших брендов (зелёный, розовый, синий,
+    фиолетовый) под это условие не подходят.
+    """
+    if not hexcolor:
+        return False
+    r, g, b = (int(hexcolor[i:i + 2], 16) for i in (1, 3, 5))
+    return r > 200 and g > 180 and b < 160 and abs(r - g) < 60
+
+
+def hex_of(color):
+    if not color:
+        return None
+    return "#%02X%02X%02X" % tuple(round(color.get(k, 0) * 255)
+                                   for k in ("red", "green", "blue"))
+
+
+def read_grid(sheet_id, tok, title, last_col="J", last_row=2000):
+    """v2.1.0. Значения ВМЕСТЕ с цветом фона: наблюдение задаётся разметкой книги.
+
+    Возвращает (строки значений, строки цветов) — одинаковой длины, цвет None
+    там, где заливки нет. Один запрос вместо двух: values + цвета приходят
+    одним rowData.
+    """
+    rng = urllib.parse.quote(f"'{title}'!A1:{last_col}{last_row}")
+    d = api(f"{sheet_id}?ranges={rng}&fields=sheets(data(rowData(values("
+            f"formattedValue,effectiveFormat.backgroundColor))))", tok)
+    rows = (d.get("sheets") or [{}])[0].get("data", [{}])[0].get("rowData", [])
+    vals, cols = [], []
+    for row in rows:
+        cells = row.get("values", [])
+        vals.append([c.get("formattedValue", "") for c in cells])
+        cols.append([hex_of(c.get("effectiveFormat", {}).get("backgroundColor"))
+                     for c in cells])
+    return vals, cols
 
 
 def norm_brand(s):
@@ -647,14 +711,21 @@ def ensure_comp_state(sheet_id, tok, sheets, dry=False):
 
     for row in vals[1:]:
         g, comp = (str(row[0]).strip() if row else ""), cell(row, "Конкурент")
+        art = cell(row, "Артикул")
         if not g or not comp:
             continue
-        state[(g, comp)] = {
+        rec = {
             "price": as_num(cell(row, "Цена")),
             "base": as_num(cell(row, "База сравнения")),
             "under": cell(row, "Дешевле нас").lower().startswith("да"),
             "event": cell(row, "Последнее событие"),
         }
+        # v2.1.0. Ключ зависит от способа наблюдения: по карточке (артикул) в
+        # книге с разметкой и по бренду в книгах без неё. Пишем под обоими —
+        # переключение способа не должно стирать историю.
+        state[(g, comp)] = rec
+        if art:
+            state[(g, art)] = rec
     return props["sheetId"], state
 
 
@@ -905,10 +976,10 @@ def main():
                  else f"час {datetime.now(MSK).hour}:00 в списке {sorted(digest_hours)}"))
 
     # ----- товарные группы с первого листа книги (WB) -----
+    # v2.1.0. Читаем значения ВМЕСТЕ с заливкой: в рабочей книге наблюдение за
+    # конкурентом задаётся жёлтой ячейкой бренда, а не списком имён.
     wb_title = sheets[0]["title"]
-    q = urllib.parse.quote("'" + wb_title.replace("'", "''") + "'")
-    rows = api(f"{a.sheet_id}/values/{q}!A1:P2000?valueRenderOption=FORMATTED_VALUE",
-               tok).get("values", [])
+    rows, colors = read_grid(a.sheet_id, tok, wb_title.replace("'", "''"))
     # Колонки ищем ПО ШАПКЕ, а не по буквам A/B/C: менеджеры заводят слева от дат
     # свои колонки (в книге автохимии это «Прогрев» и «Прогрев к-во», 31.07.2026),
     # и жёсткое «бренд = C» тихо превращает бренд в «да» — наших позиций
@@ -924,18 +995,43 @@ def main():
     i_name = col_by(("название", "товар"), 0)
     i_art = col_by(("артикул", "nmid", "sku"), 1)
     i_brand = col_by(("бренд",), 2)
-    if (i_name, i_art, i_brand) != (0, 1, 2):
+    # v2.1.0. Фасовка («Капсул») — не примечание, а условие сравнения: в рабочей
+    # книге у конкурентов в одной товарной группе банки на 60/90/120/240, и
+    # ценник конкурента с 60 капсулами «дешевле» нашего 120 всегда. Поэтому
+    # сравниваем ЦЕНУ ЗА КАПСУЛУ (менеджер руками делает ровно это), а в
+    # сообщении показываем оба числа.
+    i_pack = col_by(("капсул", "фасовк", "объём", "объем", "таблет"), None)
+    if (i_name, i_art, i_brand) != (0, 1, 2) or i_pack is not None:
         print(f"[{wb_title}] раскладка: название={col_letter(i_name)}, "
-              f"артикул={col_letter(i_art)}, бренд={col_letter(i_brand)}")
+              f"артикул={col_letter(i_art)}, бренд={col_letter(i_brand)}"
+              + (f", фасовка={col_letter(i_pack)}" if i_pack is not None else ""))
+    ours_names = split_list(cfg["Наши бренды"])
     items, group = [], None
-    for r in rows[1:]:
-        cell = lambda i: (str(r[i]).strip() if len(r) > i else "")
+    for n, r in enumerate(rows[1:], start=1):
+        cell = lambda i: (str(r[i]).strip() if (i is not None and len(r) > i) else "")
         name, art, brand = cell(i_name), cell(i_art), cell(i_brand)
         if name:
             group = name
-        if art.isdigit():
-            items.append({"group": group or "(без группы)", "art": art, "brand": brand})
-    print(f"[{wb_title}] групп {len(set(i['group'] for i in items))}, артикулов {len(items)}")
+        if not art.isdigit():
+            continue
+        pack = cell(i_pack)
+        # «120», «Хелат 240», «говяжий 155» — берём первое число; нет числа —
+        # сравнение остаётся по цене карточки
+        m_pack = re.search(r"\d+", pack)
+        crow = colors[n] if n < len(colors) else []
+        mark = crow[i_brand] if len(crow) > i_brand else None
+        items.append({"group": group or "(без группы)",
+                      "pack": int(m_pack.group()) if m_pack else None,
+                      "art": art, "brand": brand,
+                      # своё имя бренда пишется в книгах по-разному («Sunshine
+                      # Nutrition» против «SUNSHINE» в настройке) — сравниваем по
+                      # префиксу, иначе наши карточки уедут в конкуренты
+                      "ours": bool(brand_in(brand, ours_names)),
+                      "marked": is_watch_color(mark)})
+    marked_n = sum(1 for i in items if i["marked"] and not i["ours"])
+    print(f"[{wb_title}] групп {len(set(i['group'] for i in items))}, "
+          f"артикулов {len(items)}, наших {sum(1 for i in items if i['ours'])}, "
+          f"помечено жёлтым (под контролем): {marked_n}")
 
     t0 = time.time()
     live = wb_live([i["art"] for i in items])
@@ -951,7 +1047,7 @@ def main():
     # колонку получает только тот конкурент, который в этой книге реально есть:
     # у таблицы автохимии свои конкуренты, и четыре пустых колонки БАДовых
     # якорей были бы там мусором
-    comp_brands = [i["brand"] for i in items if i["brand"].strip().lower() not in ours]
+    comp_brands = [i["brand"] for i in items if not i["ours"]]
     comp_cols = [c for c in comp_cols_cfg if any(brand_in(b, [c]) for b in comp_brands)]
     dropped = [c for c in comp_cols_cfg if c not in comp_cols]
     if dropped:
@@ -972,11 +1068,22 @@ def main():
     name_pool = list(dict.fromkeys(comp_cols + anchors + group_b + watch))
     group_ctx = {}
 
+    def unit_row(i):
+        """v2.1.0. Строка для сравнения: ценник + цена за капсулу.
+
+        Фасовки нет — «за единицу» равно ценнику, и сравнение работает как
+        раньше (книги, где в группе стоят одинаковые банки).
+        """
+        price = live[i["art"]]
+        pack = i.get("pack") or 0
+        return {"art": i["art"], "brand": i["brand"], "price": price,
+                "pack": pack or None, "unit": (price / pack) if pack else price}
+
     cur, alerts, recovered = {}, [], []
     for g, lst in groups.items():
-        mine = [i for i in lst if i["brand"].strip().lower() in ours]
+        mine = [i for i in lst if i["ours"]]
         comp = [(i["brand"], live[i["art"]], i["art"]) for i in lst
-                if i["brand"].strip().lower() not in ours and i["art"] in live]
+                if not i["ours"] and i["art"] in live]
         # цена бренда из справочника в этой группе (если карточек несколько —
         # самая дешёвая: сравниваем с лучшим предложением конкурента). Артикул
         # едет вместе с ценой: он и есть то, что менеджер копирует из ячейки.
@@ -988,9 +1095,11 @@ def main():
         # v2.0.0. Контекст группы для событий: чужие цены поимённо и наши позиции
         # с ценами — из них строится строка «мы: NATURI 1 390 ₽ (+17 %)».
         group_ctx[g] = {"comp": dict(bprice),
-                        "ours": [{"art": i["art"], "brand": i["brand"],
-                                  "price": live[i["art"]]}
-                                 for i in mine if i["art"] in live]}
+                        "ours": [unit_row(i) for i in mine if i["art"] in live],
+                        # v2.1.0. Помеченные карточки конкурентов этой группы:
+                        # наблюдение ведётся по карточке, а не по бренду
+                        "cards": [unit_row(i) for i in lst
+                                  if i["marked"] and not i["ours"] and i["art"] in live]}
         anch_prices = [bprice[x][0] for x in anchors if x in bprice]
         # Минимум считается по всем конкурентам. Настройкой «Сигнал без группы Б»
         # менеджер может выкинуть из него второй эшелон — тогда сигнал живёт по
@@ -1078,26 +1187,39 @@ def main():
     # состояние, а состояние никто не читает (голосовое Артура).
     comp_gid, comp_prev, comp_rows = None, {}, []
     events, back, undercut_now = [], [], []
+    # v2.1.0. Разметка книги главнее настроек: покрасил менеджер ячейку бренда
+    # жёлтым — карточка под контролем, и список имён в настройках не нужен.
+    marked_mode = any(i["marked"] and not i["ours"] for i in items)
     if event_mode:
+        print("наблюдение: " + ("жёлтые карточки листа" if marked_mode
+                                else f"бренды из настроек {watch or '—'}"))
         comp_gid, comp_prev = ensure_comp_state(a.sheet_id, tok, sheets, dry=a.dry_run)
         for g in sorted(group_ctx):
             ctx = group_ctx[g]
-            ours_list = sorted(ctx["ours"], key=lambda x: x["price"])
-            our_min = ours_list[0]["price"] if ours_list else None
-            for name in watch:
-                pa = ctx["comp"].get(name)
-                if not pa:
-                    continue
-                price, art = pa
-                was = comp_prev.get((g, name), {})
+            # сравнение внутри группы — по цене за капсулу: банки разной фасовки
+            # иначе несопоставимы (60 капсул конкурента «дешевле» наших 120)
+            ours_list = sorted(ctx["ours"], key=lambda x: x["unit"])
+            our_best = ours_list[0] if ours_list else None
+            our_min = our_best["unit"] if our_best else None
+            # v2.1.0. Есть разметка книги — наблюдаем помеченные КАРТОЧКИ; нет
+            # разметки (старые книги) — прежний путь по именам брендов.
+            if marked_mode:
+                watched = [(c["brand"], c, c["art"]) for c in ctx["cards"]]
+            else:
+                watched = [(n, {"price": ctx["comp"][n][0], "art": ctx["comp"][n][1],
+                                "pack": None, "unit": ctx["comp"][n][0]}, n)
+                           for n in watch if n in ctx["comp"]]
+            for name, card, state_key in watched:
+                price, art, unit = card["price"], card["art"], card["unit"]
+                was = comp_prev.get((g, state_key), {})
                 # база — от чего меряем падение. Нет памяти (первый прогон,
                 # новая карточка) — база = сегодняшняя цена: сигнала не будет,
                 # но со следующего прогона движение уже видно.
                 base = was.get("base") or was.get("price") or price
                 was_under = bool(was.get("under"))
-                under = our_min is not None and price < our_min
+                under = our_min is not None and unit < our_min
                 drop = round((price / base - 1) * 100, 1) if base else 0.0
-                dearer = [o for o in ours_list if o["price"] > price]
+                dearer = [o for o in ours_list if o["unit"] > unit]
                 kind = None
                 if under and drop <= -drop_pct:
                     # «ушёл ещё ниже» — он и раньше был дешевле нас, но с прошлого
@@ -1106,8 +1228,9 @@ def main():
                 elif was_under and not under:
                     kind = "вернул цену"
                 ev = {"group": g, "comp": name, "art": art, "price": price,
+                      "pack": card.get("pack"), "unit": unit,
                       "base": base, "drop": drop, "under": under,
-                      "our_min": our_min, "dearer": dearer,
+                      "our_min": our_min, "our_best": our_best, "dearer": dearer,
                       "brands": sorted({o["brand"] for o in (dearer or ours_list)}),
                       "kind": kind}
                 if kind in ("стал дешевле", "ушёл ещё ниже"):
@@ -1125,7 +1248,7 @@ def main():
                                   our_min if our_min is not None else "",
                                   (f"{now_s} {kind}" if kind else was.get("event", "")),
                                   now_s])
-        print(f"наблюдаемых пар «группа × конкурент»: {len(comp_rows)}, "
+        print(f"под наблюдением карточек: {len(comp_rows)}, "
               f"дешевле нас сейчас: {len(undercut_now)}, событий: {len(events)}, "
               f"вернули цену: {len(back)}")
 
@@ -1170,13 +1293,18 @@ def main():
                 again = " · упал ещё" if ev["kind"] == "ушёл ещё ниже" else ""
                 lines.append(f"{mark} <b>{esc(ev['comp'])}</b>{again} · "
                              f"<a href=\"{wb_url(ev['art'])}\">{esc(ev['group'])}</a>")
+                pack = (f" · {ev['pack']} шт, {ev['unit']:.1f} ₽/шт"
+                        if ev.get("pack") else "")
                 lines.append(f"было {ev['base']:.0f} ₽ → <b>{ev['price']:.0f} ₽</b> "
-                             f"({ev['drop']:+.0f}%) · <code>{ev['art']}</code>")
+                             f"({ev['drop']:+.0f}%){pack} · <code>{ev['art']}</code>")
                 if ev["dearer"]:
-                    # наши позиции, которые теперь дороже него, — по ним и решение
+                    # наши позиции, которые теперь дороже него, — по ним и решение.
+                    # Процент считается по цене за штуку: у нас и у него банки
+                    # разной фасовки, и разница ценников сама по себе ничего не значит
                     who = " · ".join(
-                        f"{esc(o['brand'])} <code>{o['art']}</code> {o['price']:.0f} ₽ "
-                        f"({(o['price'] / ev['price'] - 1) * 100:+.0f}%)"
+                        f"{esc(o['brand'])} <code>{o['art']}</code> {o['price']:.0f} ₽"
+                        + (f"/{o['pack']}" if o.get("pack") else "")
+                        + f" ({(o['unit'] / ev['unit'] - 1) * 100:+.0f}%)"
                         for o in ev["dearer"][:4])
                     lines.append(f"мы дороже: {who}")
                 else:
@@ -1199,14 +1327,19 @@ def main():
         if digest:
             # Контрольный срез в часы сводки: короткий, иначе он превращается в
             # ту самую «кашу», ради ухода от которой сделан событийный режим.
-            u = sorted(part_watch, key=lambda e: -(e["our_min"] / e["price"] - 1)
-                       if (e["our_min"] and e["price"]) else 0)
+            u = sorted(part_watch, key=lambda e: -(e["our_min"] / e["unit"] - 1)
+                       if (e["our_min"] and e["unit"]) else 0)
             lines.append(f"📊 <b>{MP_LABEL} · Контроль {now_s} МСК</b> — "
                          f"дешевле нас сейчас: {len(u)}")
             for ev in u[:10]:
-                gap = ((ev["our_min"] / ev["price"] - 1) * 100) if ev["our_min"] else 0
+                gap = ((ev["our_min"] / ev["unit"] - 1) * 100) if ev["our_min"] else 0
+                mine = ev.get("our_best") or {}
                 lines.append(f"• {esc(ev['comp'])} · {esc(ev['group'])} "
-                             f"{ev['price']:.0f} ₽ (мы {ev['our_min']:.0f} ₽, {gap:+.0f}%)")
+                             f"{ev['price']:.0f} ₽"
+                             + (f"/{ev['pack']}" if ev.get("pack") else "")
+                             + f" (мы {mine.get('price', 0):.0f} ₽"
+                             + (f"/{mine['pack']}" if mine.get("pack") else "")
+                             + f", {gap:+.0f}%)")
             if len(u) > 10:
                 lines.append(f"…и ещё {len(u) - 10}")
             if not u:

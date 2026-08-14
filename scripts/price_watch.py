@@ -1,7 +1,34 @@
 #!/usr/bin/env python3
-"""PRICE WATCH v1.2.0 — 06.08.2026. Часовой монитор «мы стали дороже конкурентов».
+"""PRICE WATCH v2.0.0 — 14.08.2026. Монитор цен: событие по конкретному конкуренту.
 
 История версий (новое сверху, старое не переписывать):
+
+v2.0.0 — 14.08.2026
+  «ЭТО КАША, Я УЖЕ НЕ СМОТРЮ» — голосовое Артура 14.08.2026. Прежний монитор
+  каждый час присылал СОСТОЯНИЕ («мы дороже минимума по 43 позициям из 124»):
+  список надо читать целиком, решать по нему нечего, и его перестали открывать
+  и он, и менеджеры. Дословно: «если бы он точечно давал инфу — вот этот
+  конкурент резко опустил цену и стал дешевле — это бы здорово работало».
+  • Режим по умолчанию сменён на СОБЫТИЙНЫЙ (настройка «Режим сигнала»:
+    события / обзор). Событие ровно одно: **наблюдаемый конкурент уронил цену
+    на N % и стал дешевле нас**. Нет события — нет сообщения.
+  • Наблюдаем не всех: настройка «Конкуренты под наблюдением» (пусто = берём
+    «Колонки конкурентов»). Смысл — те 2–3 бренда, по которым реально ходят.
+  • Порог события — своя настройка «Падение конкурента, %» (5): он про ДВИЖЕНИЕ
+    чужой цены, а прежний «Порог, %» — про наш разрыв с рынком, это разные вещи.
+  • В сообщении то, чего раньше не было вовсе: имя конкурента, его было → стало,
+    и наши позиции этой группы с текущим отставанием. Решение принимается из
+    сообщения, без открытия таблицы.
+  • Цены конкурентов хранятся между прогонами в новом листе «Конкуренты
+    (наблюдение)»: группа × конкурент, цена, база сравнения, «дешевле нас».
+    База поднимается сама, когда конкурент отыгрывает цену вверх, поэтому
+    падение всегда меряется от последнего максимума, а не от цены год назад.
+  • Анти-спам: после сигнала база = новая цена, повтор — только если упал ЕЩЁ
+    на порог. Отдельной строкой «вернул цену», когда конкурент снова дороже нас.
+  • Сводка в часы «Полный отчёт в часы» тоже стала короткой: сколько
+    наблюдаемых конкурентов сейчас дешевле нас и кто именно (до 10 строк).
+  • Прежний формат никуда не делся: «Режим сигнала» = обзор возвращает v1.2.0
+    целиком (компактный/подробный, пороги в обе стороны, «дешевле всех»).
 
 v1.2.0 — 06.08.2026
   «ПОВТОРЫ НЕ ТОЛЬКО ПО РОСТУ РАЗРЫВА, НО И ТРИ РАЗА В ДЕНЬ ЦЕЛИКОМ» — правка
@@ -72,6 +99,11 @@ import jwt
 
 BASE = "https://sheets.googleapis.com/v4/spreadsheets/"
 MON_TITLE = "Мониторинг цен"
+# v2.0.0. Память по чужим ценам: событие «упал на N %» невозможно посчитать без
+# прошлой цены, а лист мониторинга хранит наши позиции, а не конкурентов.
+COMP_TITLE = "Конкуренты (наблюдение)"
+COMP_COLS = ["Группа", "Конкурент", "Артикул", "Цена", "База сравнения",
+             "Дешевле нас", "Наша мин. цена", "Последнее событие", "Обновлено"]
 MSK = timezone(timedelta(hours=3))
 # Раскладка колонок: слева фиксированные, в середине — конкуренты ПОИМЁННО
 # (состав ведёт менеджер настройкой «Колонки конкурентов»), справа служебные.
@@ -92,6 +124,12 @@ DEFAULTS = {"Порог, %": "5", "Получатели TG": "", "Часы ра�
             "Сигнал без группы Б": "нет",
             "Разбивать по брендам": "нет", "Чаты по брендам": "",
             "Формат сообщения": "компактный",
+            # v2.0.0. Событийный режим: сообщение только когда наблюдаемый
+            # конкурент уронил цену и стал дешевле нас. «обзор» = прежний v1.2.0.
+            "Режим сигнала": "события",
+            "Конкуренты под наблюдением": "",
+            "Падение конкурента, %": "5",
+            "Событий в сообщении, максимум": "10",
             "Тест: всё в чат": ""}
 DAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
 # Раскладка листа СЧИТАЕТСЯ от числа настроек, а не забита числами: иначе новая
@@ -125,7 +163,16 @@ NOTE = ("порог работает в обе стороны: на стольк
         "NATURI=-100…:5, SUNSHINE=-100…:7 — пусто = берётся из ключей отчёта. "
         "«Тест: всё в чат» — репетиция рассылки: разбивка по брендам включается "
         "принудительно, но все сообщения уходят в указанный чат с пометкой, куда "
-        "они пойдут в бою; состояние при этом не помечается")
+        "они пойдут в бою; состояние при этом не помечается. "
+        "«Режим сигнала»: события (по умолчанию) — сообщение приходит ТОЛЬКО когда "
+        "наблюдаемый конкурент уронил цену на «Падение конкурента, %» и стал дешевле "
+        "нас; в сообщении его имя, было → стало и наши позиции этой группы. "
+        "обзор — прежний вид: вся текущая картина «мы дороже/дешевле рынка». "
+        "«Конкуренты под наблюдением» — за чьей ценой следим (пусто = «Колонки "
+        "конкурентов»); держите тут 2–3 бренда, по которым реально принимаете решения. "
+        "Цены конкурентов между прогонами лежат на листе «Конкуренты (наблюдение)»: "
+        "там же база сравнения — от неё считается падение, и она сама поднимается, "
+        "когда конкурент отыгрывает цену вверх")
 # повторное уведомление по той же позиции — только если разрыв вырос на столько п.п.
 REALERT_STEP = 3.0
 # Гистерезис: вход в сигнал по порогу, выход — когда разрыв ужался до половины
@@ -559,6 +606,81 @@ def ensure_monitor(sheet_id, tok, sheets, tg_default, dry=False):
     return props["sheetId"], cfg, state, old_head, old_cols
 
 
+def ensure_comp_state(sheet_id, tok, sheets, dry=False):
+    """v2.0.0. Лист «Конкуренты (наблюдение)» — память по чужим ценам.
+
+    Ключ строки — «группа + конкурент»: один и тот же бренд стоит в разных
+    товарных группах с разными карточками, и падение считается внутри группы.
+    Возвращает (gid, {(группа, конкурент): {цена, база, дешевле, событие}}).
+    При dry=True лист не создаётся: сухой прогон ничего не должен писать.
+    """
+    props = next((p for p in sheets if p["title"] == COMP_TITLE), None)
+    if not props:
+        if dry:
+            print(f"  dry-run: листа «{COMP_TITLE}» нет — считаю, что памяти пока нет")
+            return None, {}
+        print(f"Лист «{COMP_TITLE}» не найден — создаю")
+        try:
+            res = api(sheet_id + ":batchUpdate", tok, "POST", {"requests": [
+                {"addSheet": {"properties": {"title": COMP_TITLE,
+                                             "gridProperties": {"rowCount": 500,
+                                                                "columnCount": len(COMP_COLS)}}}}]})
+            props = res["replies"][0]["addSheet"]["properties"]
+        except urllib.error.HTTPError as e:
+            if e.code != 400:
+                raise
+            props = find_sheet(sheet_id, tok, COMP_TITLE)
+            if not props:
+                raise
+            print("  лист уже был создан (ответ на создание потерялся) — продолжаю")
+
+    q = urllib.parse.quote("'" + COMP_TITLE + "'")
+    vals = api(f"{sheet_id}/values/{q}!A1:I5000?valueRenderOption=FORMATTED_VALUE",
+               tok).get("values", [])
+    head = [str(c).strip() for c in (vals[0] if vals else [])]
+    idx = {name: head.index(name) for name in COMP_COLS if name in head}
+    state = {}
+
+    def cell(row, name):
+        i = idx.get(name)
+        return str(row[i]).strip() if (i is not None and len(row) > i) else ""
+
+    for row in vals[1:]:
+        g, comp = (str(row[0]).strip() if row else ""), cell(row, "Конкурент")
+        if not g or not comp:
+            continue
+        state[(g, comp)] = {
+            "price": as_num(cell(row, "Цена")),
+            "base": as_num(cell(row, "База сравнения")),
+            "under": cell(row, "Дешевле нас").lower().startswith("да"),
+            "event": cell(row, "Последнее событие"),
+        }
+    return props["sheetId"], state
+
+
+def write_comp_state(sheet_id, tok, gid, rows, now_s):
+    """v2.0.0. Перезапись листа памяти: строка = группа × наблюдаемый конкурент."""
+    q = urllib.parse.quote("'" + COMP_TITLE + "'")
+    api(sheet_id + ":batchUpdate", tok, "POST", {"requests": [
+        {"updateSheetProperties": {
+            "properties": {"sheetId": gid,
+                           "gridProperties": {"rowCount": len(rows) + 40,
+                                              "columnCount": len(COMP_COLS)}},
+            "fields": "gridProperties(rowCount,columnCount)"}},
+        {"repeatCell": {"range": {"sheetId": gid, "startRowIndex": 0, "endRowIndex": 1},
+                        "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
+                        "fields": "userEnteredFormat.textFormat.bold"}},
+        {"updateSheetProperties": {"properties": {"sheetId": gid,
+                                                  "gridProperties": {"frozenRowCount": 1}},
+                                   "fields": "gridProperties.frozenRowCount"}}]})
+    api(f"{sheet_id}/values/{q}!A2:I5000:clear", tok, "POST", {})
+    api(sheet_id + "/values:batchUpdate", tok, "POST", {
+        "valueInputOption": "USER_ENTERED",
+        "data": [{"range": f"'{COMP_TITLE}'!A1", "values": [COMP_COLS]},
+                 {"range": f"'{COMP_TITLE}'!A2", "values": rows}] if rows else
+                [{"range": f"'{COMP_TITLE}'!A1", "values": [COMP_COLS]}]})
+
+
 def layout_sheet(sheet_id, tok, gid, cfg, L, old_head, old_cols, dry=False):
     """Верх листа: блок настроек, строка «Сейчас», шапка таблицы.
 
@@ -726,6 +848,14 @@ def main():
     # Состояние не помечается — после теста боевой прогон шлёт всё как в первый раз.
     # v1.1.0. Компактный вид по умолчанию; «подробный» в ячейке возвращает прежний
     compact = not cfg["Формат сообщения"].strip().lower().startswith("подроб")
+    # v2.0.0. Событийный режим — основной: сообщение только про движение чужой
+    # цены. «обзор» возвращает прежнее поведение целиком.
+    event_mode = not cfg["Режим сигнала"].strip().lower().startswith("обзор")
+    watch_names = split_list(cfg["Конкуренты под наблюдением"])
+    drop_pct = as_num(cfg["Падение конкурента, %"]) or 5.0
+    # Потолок разбора в сообщении: в книге, где конкурентов сотни (автохимия),
+    # день с общим падением рынка иначе превращает событийный сигнал в ту же кашу.
+    ev_limit = int(as_num(cfg["Событий в сообщении, максимум"]) or 10)
     test_targets = parse_targets(cfg["Тест: всё в чат"])
     if test_targets:
         split_brands = True
@@ -736,7 +866,12 @@ def main():
             b, dst = part.split("=", 1)
             if b.strip() and dst.strip():
                 route_map[b.strip().lower()] = parse_targets(dst)
-    print(f"формат сообщения: {'компактный' if compact else 'подробный'}")
+    if event_mode:
+        print(f"режим сигнала: события — падение конкурента от {drop_pct}% "
+              f"с уходом ниже нашей цены; наблюдаем: "
+              f"{watch_names or comp_cols_cfg or '—'}")
+    else:
+        print(f"режим сигнала: обзор, формат {'компактный' if compact else 'подробный'}")
     print(f"рассылка: {'по брендам' if split_brands else 'общая'}"
           + (f", переопределений в листе {len(route_map)}" if route_map else "")
           + (f", ТЕСТ: всё в {cfg['Тест: всё в чат'].strip()}" if test_targets else ""))
@@ -827,6 +962,16 @@ def main():
           + (", группа Б исключена из расчёта минимума" if skip_b else ""))
     layout_sheet(a.sheet_id, tok, gid, cfg, L, old_head, old_cols, dry=a.dry_run)
 
+    # v2.0.0. Наблюдаемые конкуренты: настройка, а по умолчанию — те же, что
+    # показаны колонками. Их цены надо разложить по группам ДО событий, поэтому
+    # имена участвуют в общем пуле сопоставления брендов.
+    # Пусто в настройке — берём колонки; их тоже нет (книга автохимии: там свои
+    # конкуренты, и БАДовые имена ей не подходят) — наблюдаем всех конкурентов
+    # книги. Событие всё равно редкое: нужно и падение на порог, и уход ниже нас.
+    watch = watch_names or comp_cols or sorted({b.strip() for b in comp_brands if b.strip()})
+    name_pool = list(dict.fromkeys(comp_cols + anchors + group_b + watch))
+    group_ctx = {}
+
     cur, alerts, recovered = {}, [], []
     for g, lst in groups.items():
         mine = [i for i in lst if i["brand"].strip().lower() in ours]
@@ -837,9 +982,15 @@ def main():
         # едет вместе с ценой: он и есть то, что менеджер копирует из ячейки.
         bprice = {}
         for b, p, art in comp:
-            name = brand_in(b, comp_cols + anchors + group_b)
+            name = brand_in(b, name_pool)
             if name and p < bprice.get(name, (10 ** 9, ""))[0]:
                 bprice[name] = (p, art)
+        # v2.0.0. Контекст группы для событий: чужие цены поимённо и наши позиции
+        # с ценами — из них строится строка «мы: NATURI 1 390 ₽ (+17 %)».
+        group_ctx[g] = {"comp": dict(bprice),
+                        "ours": [{"art": i["art"], "brand": i["brand"],
+                                  "price": live[i["art"]]}
+                                 for i in mine if i["art"] in live]}
         anch_prices = [bprice[x][0] for x in anchors if x in bprice]
         # Минимум считается по всем конкурентам. Настройкой «Сигнал без группы Б»
         # менеджер может выкинуть из него второй эшелон — тогда сигнал живёт по
@@ -921,6 +1072,63 @@ def main():
           f"дешевле на >{thr_pct}%: {total_under}, новых сигналов: {len(alerts)}, "
           f"вернулись к рынку: {len(recovered)}")
 
+    # ----- v2.0.0. События по наблюдаемым конкурентам -----
+    # Единственное событие, ради которого монитор существует после 14.08.2026:
+    # НАБЛЮДАЕМЫЙ конкурент уронил цену и стал дешевле нас. Всё остальное —
+    # состояние, а состояние никто не читает (голосовое Артура).
+    comp_gid, comp_prev, comp_rows = None, {}, []
+    events, back, undercut_now = [], [], []
+    if event_mode:
+        comp_gid, comp_prev = ensure_comp_state(a.sheet_id, tok, sheets, dry=a.dry_run)
+        for g in sorted(group_ctx):
+            ctx = group_ctx[g]
+            ours_list = sorted(ctx["ours"], key=lambda x: x["price"])
+            our_min = ours_list[0]["price"] if ours_list else None
+            for name in watch:
+                pa = ctx["comp"].get(name)
+                if not pa:
+                    continue
+                price, art = pa
+                was = comp_prev.get((g, name), {})
+                # база — от чего меряем падение. Нет памяти (первый прогон,
+                # новая карточка) — база = сегодняшняя цена: сигнала не будет,
+                # но со следующего прогона движение уже видно.
+                base = was.get("base") or was.get("price") or price
+                was_under = bool(was.get("under"))
+                under = our_min is not None and price < our_min
+                drop = round((price / base - 1) * 100, 1) if base else 0.0
+                dearer = [o for o in ours_list if o["price"] > price]
+                kind = None
+                if under and drop <= -drop_pct:
+                    # «ушёл ещё ниже» — он и раньше был дешевле нас, но с прошлого
+                    # сигнала уронил ещё на порог: это новая новость, а не повтор
+                    kind = "стал дешевле" if not was_under else "ушёл ещё ниже"
+                elif was_under and not under:
+                    kind = "вернул цену"
+                ev = {"group": g, "comp": name, "art": art, "price": price,
+                      "base": base, "drop": drop, "under": under,
+                      "our_min": our_min, "dearer": dearer,
+                      "brands": sorted({o["brand"] for o in (dearer or ours_list)}),
+                      "kind": kind}
+                if kind in ("стал дешевле", "ушёл ещё ниже"):
+                    events.append(ev)
+                elif kind == "вернул цену":
+                    back.append(ev)
+                if under:
+                    undercut_now.append(ev)
+                # База поднимается за конкурентом вверх и сбрасывается на текущую
+                # цену после сигнала: следующий сигнал — только если упал ЕЩЁ на
+                # порог, а не потому, что мы всё ещё помним прошлогодний максимум.
+                new_base = price if (kind and kind != "вернул цену") else max(base, price)
+                comp_rows.append([g, name, art, price, new_base,
+                                  "да" if under else "нет",
+                                  our_min if our_min is not None else "",
+                                  (f"{now_s} {kind}" if kind else was.get("event", "")),
+                                  now_s])
+        print(f"наблюдаемых пар «группа × конкурент»: {len(comp_rows)}, "
+              f"дешевле нас сейчас: {len(undercut_now)}, событий: {len(events)}, "
+              f"вернули цену: {len(back)}")
+
     # ----- сообщения (по адресатам) -----
     def targets_for(brand):
         """Куда слать сигнал по этому бренду. Пока разбивка выключена — всем в
@@ -934,6 +1142,79 @@ def main():
             return route_map[b]
         raw = K.get(re.sub(r"[^A-Z0-9]", "", brand.upper()) + "_TG_CHATS", "")
         return parse_targets(raw) if raw else default_targets
+
+    def wb_url(art):
+        return f"https://www.wildberries.ru/catalog/{art}/detail.aspx"
+
+    def build_events(part_events, part_back, part_watch, brands):
+        """v2.0.0. Сообщение-событие: кто уронил цену, было → стало, кого задело.
+
+        Читается сверху вниз без таблицы: имя конкурента, движение его цены,
+        наши позиции этой группы и на сколько мы теперь дороже. Заказ Артура
+        14.08.2026 дословно: «вот этот конкурент резко опустил цену и стал
+        дешевле — это бы здорово работало».
+        """
+        head_brand = ", ".join(brands)[:60] if brands else "все бренды"
+        lines = []
+        if part_events:
+            ordered = sorted(part_events, key=lambda e: e["drop"])
+            shown, rest = ordered[:ev_limit], ordered[ev_limit:]
+            lines.append(f"📉 <b>{MP_LABEL} · Конкурент уронил цену — {now_s} МСК</b>")
+            lines.append(f"<i>{esc(head_brand)}</i>"
+                         + (f" · всего падений: {len(ordered)}" if rest else ""))
+            lines.append("")
+            for ev in shown:
+                mark = sev_mark(abs(ev["drop"]))
+                # он и до этого стоял дешевле нас — значит новость в том, что
+                # уронил ещё; без пометки это читается как «уже присылали»
+                again = " · упал ещё" if ev["kind"] == "ушёл ещё ниже" else ""
+                lines.append(f"{mark} <b>{esc(ev['comp'])}</b>{again} · "
+                             f"<a href=\"{wb_url(ev['art'])}\">{esc(ev['group'])}</a>")
+                lines.append(f"было {ev['base']:.0f} ₽ → <b>{ev['price']:.0f} ₽</b> "
+                             f"({ev['drop']:+.0f}%) · <code>{ev['art']}</code>")
+                if ev["dearer"]:
+                    # наши позиции, которые теперь дороже него, — по ним и решение
+                    who = " · ".join(
+                        f"{esc(o['brand'])} <code>{o['art']}</code> {o['price']:.0f} ₽ "
+                        f"({(o['price'] / ev['price'] - 1) * 100:+.0f}%)"
+                        for o in ev["dearer"][:4])
+                    lines.append(f"мы дороже: {who}")
+                else:
+                    lines.append("мы всё ещё дешевле его")
+                lines.append("")
+            if rest:
+                # хвост — одной строкой: он нужен как факт «упало ещё столько-то»,
+                # разбирать его в чате никто не будет
+                tail = " · ".join(f"{esc(e['comp'])} {esc(e['group'])} "
+                                  f"{e['drop']:+.0f}%" for e in rest[:8])
+                more = f" и ещё {len(rest) - 8}" if len(rest) > 8 else ""
+                lines.append(f"Ещё падения: {tail}{more}")
+                lines.append("")
+        if part_back:
+            names = " · ".join(f"{esc(e['comp'])} ({esc(e['group'])}) "
+                               f"{e['price']:.0f} ₽" for e in part_back[:6])
+            more = f" и ещё {len(part_back) - 6}" if len(part_back) > 6 else ""
+            lines.append(f"✅ Вернули цену выше нашей: {names}{more}")
+            lines.append("")
+        if digest:
+            # Контрольный срез в часы сводки: короткий, иначе он превращается в
+            # ту самую «кашу», ради ухода от которой сделан событийный режим.
+            u = sorted(part_watch, key=lambda e: -(e["our_min"] / e["price"] - 1)
+                       if (e["our_min"] and e["price"]) else 0)
+            lines.append(f"📊 <b>{MP_LABEL} · Контроль {now_s} МСК</b> — "
+                         f"дешевле нас сейчас: {len(u)}")
+            for ev in u[:10]:
+                gap = ((ev["our_min"] / ev["price"] - 1) * 100) if ev["our_min"] else 0
+                lines.append(f"• {esc(ev['comp'])} · {esc(ev['group'])} "
+                             f"{ev['price']:.0f} ₽ (мы {ev['our_min']:.0f} ₽, {gap:+.0f}%)")
+            if len(u) > 10:
+                lines.append(f"…и ещё {len(u) - 10}")
+            if not u:
+                lines.append("✅ Ни один наблюдаемый конкурент не стоит дешевле нас")
+            lines.append("")
+        lines.append(f"<a href=\"https://docs.google.com/spreadsheets/d/{a.sheet_id}/edit\">"
+                     f"Таблица цен {MP_LABEL}</a>")
+        return "\n".join(lines), f"📉 <b>{MP_LABEL} · {esc(head_brand)}</b>"
 
     def build_compact(part_alerts, part_recovered, scope):
         """v1.1.0. Одна строка на позицию, самое большое превышение сверху.
@@ -1124,8 +1405,62 @@ def main():
                 return False
         return True
 
+    def addr_of(t):
+        return ", ".join(c + (":" + th if th else "") for c, th in t) or "—"
+
     sent_keys = set()
-    if alerts or recovered or digest:
+    if event_mode:
+        # Маршрут события — бренды НАШИХ позиций этой группы: сигнал про чужую
+        # цену нужен тому, кто отвечает за наш товар рядом с ней.
+        routes = {}
+
+        def bucket(brand):
+            k = brand.strip() if test_targets else tuple(targets_for(brand))
+            return routes.setdefault(k, {"e": [], "b": [], "w": [], "brands": set(),
+                                         "seen": set()})
+
+        def put(ev, slot):
+            for b in ev["brands"]:
+                r = bucket(b)
+                r["brands"].add(b)
+                if (slot, id(ev)) not in r["seen"]:
+                    r["seen"].add((slot, id(ev)))
+                    r[slot].append(ev)
+
+        for ev in events:
+            put(ev, "e")
+        for ev in back:
+            put(ev, "b")
+        for ev in undercut_now:
+            put(ev, "w")
+        if digest:
+            for brand in sorted({s["brand"] for s in cur.values()}):
+                bucket(brand)["brands"].add(brand)
+        if not (events or back or digest):
+            print("событий нет — сообщения не отправлялись")
+            routes = {}
+
+        for key, data in routes.items():
+            if not (data["e"] or data["b"] or digest):
+                continue
+            text, cont_head = build_events(data["e"], data["b"], data["w"],
+                                           sorted(data["brands"]))
+            if test_targets:
+                targets, real = list(test_targets), targets_for(key)
+                text = (f"🧪 <b>ТЕСТ рассылки.</b> Бренд <b>{html.escape(key)}</b>, "
+                        f"в бою уйдёт в <code>{addr_of(real)}</code>\n\n" + text)
+            else:
+                targets = list(key)
+            who = addr_of(targets)
+            if a.dry_run:
+                print(f"\n----- сообщение для {who} (dry-run, не отправлено) -----")
+                print(text)
+                continue
+            if not tg_token or not targets:
+                print(f"ВНИМАНИЕ: некуда слать ({who}) — сообщение пропущено")
+                continue
+            send_chunked(list(targets), text, cont_head)
+    elif alerts or recovered or digest:
         # раскладываем сигналы по адресатам: у каждого чата своё сообщение и
         # свои счётчики, чтобы бренду не прилетала чужая статистика
         # ключ маршрута — адресат; в тестовом режиме адресат у всех один, поэтому
@@ -1239,6 +1574,13 @@ def main():
     decorate(a.sheet_id, tok, gid, [row_style(s) for _, s in order],
              [art_style(s) for _, s in order], need_rows, bool(total_over), L)
     print(f"лист «{MON_TITLE}»: записано {len(out)} строк, наверху — {out[0][1] if out else '—'}")
+    # v2.0.0. Память по чужим ценам пишется ВСЕГДА в событийном режиме, даже
+    # когда событий не было: без свежей базы следующий прогон меряет падение от
+    # устаревшей цены и либо промолчит, либо выдаст выдуманный обвал.
+    if event_mode and comp_gid:
+        write_comp_state(a.sheet_id, tok, comp_gid, comp_rows, now_s)
+        print(f"лист «{COMP_TITLE}»: {len(comp_rows)} пар «группа × конкурент», "
+              f"дешевле нас {sum(1 for r in comp_rows if r[5] == 'да')}")
     print("DONE")
 
 

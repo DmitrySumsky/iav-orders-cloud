@@ -43,8 +43,10 @@ jobs:
           API_KEYS_EXTRA: ${{ secrets.API_KEYS_EXTRA }}
           SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
         run: |
-          printf '%s' "$API_KEYS" > api_keys.txt
-          printf '\n%s\n' "$API_KEYS_EXTRA" >> api_keys.txt
+          # tr -d '\r': секреты заливались с Windows (CRLF), \r уезжал в конец
+          # значения ключа и ломал URL Sheets API (PRICES_GSHEET_ID, шаг «Цены»)
+          printf '%s' "$API_KEYS" | tr -d '\r' > api_keys.txt
+          printf '\n%s\n' "$API_KEYS_EXTRA" | tr -d '\r' >> api_keys.txt
           printf '%s' "$SA_JSON" > google_sa.json
           python3 -c "import json; print('SA:', json.load(open('google_sa.json')).get('client_email'))" || echo "SA нет — Google Sheets будут пропущены"
 

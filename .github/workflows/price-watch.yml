@@ -38,7 +38,7 @@ jobs:
           python-version: "3.12"
 
       - name: Зависимости
-        run: pip install PyJWT cryptography
+        run: pip install -r requirements.txt
 
       - name: Секреты -> файлы
         env:

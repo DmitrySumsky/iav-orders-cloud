@@ -12,6 +12,10 @@
 import argparse, json, os, re, sys, time, urllib.request, urllib.error, urllib.parse
 from datetime import date, timedelta, datetime, timezone
 
+from mpcore import mpstats
+from mpcore import states as mp_states
+from mpcore import wb_card
+
 TIME_BUDGET = int(__import__("os").environ.get("TIME_BUDGET", 33))
 T0 = time.time()
 MSK = timezone(timedelta(hours=3))
@@ -258,19 +262,13 @@ def main():
     # WB: публичный card.wb.ru → product (цена на витрине). Ozon: MPStats
     # ozon_card_price (цена с Ozon Картой) — клиентскую Seller API не отдаёт.
     if has_wb and S.get("wb_client_price") is None:
-        prices = {}
+        # Обход витрины — в ядре (`mp-core`). Округление оставлено СВОЁ:
+        # состояние копится с прежней версии, и смена правила сдвинула бы
+        # часть цен на рубль — это читалось бы как сбой сбора.
         nm_all = [c["nmID"] for c in S["wb_cards"]]
-        for i in range(0, len(nm_all), 50):
-            chunk = ";".join(str(n) for n in nm_all[i:i+50])
-            try:
-                d = http(f"https://card.wb.ru/cards/v4/detail?appType=1&curr=rub&dest=-1257786&nm={chunk}")
-            except Exception:
-                continue
-            for p in d.get("products", []):
-                pr = (p.get("sizes", [{}]) or [{}])[0].get("price", {}) or {}
-                if pr.get("product"):
-                    prices[str(p["id"])] = round(pr["product"] / 100)
-            time.sleep(0.3)
+        found = wb_card.prices([str(n) for n in nm_all],
+                               convert=lambda kopeks: round(kopeks / 100))
+        prices = {nm: value for nm, value in found.items() if mp_states.is_price(value)}
         S["wb_client_price"] = prices; save()
         print(f"WB client prices: {len(prices)}")
 
@@ -283,26 +281,23 @@ def main():
             off = (S["ozon"].get(sk) or {}).get("offer_id", "")
             return ozst.get(off, 0) > 0 or ozo14.get(str(sk), 0) > 0
         skus = [s for s in (S.get("ozon") or {}) if str(s) not in prices and _act(s)]
-        MP_H = {"X-Mpstats-TOKEN": mp_token, "Content-Type": "application/json"}
+        # Клиент платной аналитики — в ядре. Флаг квоты живёт на клиенте:
+        # первый же отказ по лимиту гасит остальные запросы этого контура,
+        # а не выбивает их по одному до конца списка.
+        mp = mpstats.Client(mp_token, mpstats.KIND_OZON)
         done_n = 0
         for sku in skus:
             if budget_left() < 4:
                 S["oz_cp_partial"] = prices; save()
                 print("PROGRESS oz prices — перезапусти"); return
             prices[str(sku)] = None  # помечаем обработанным сразу (чтобы не зациклиться)
-            try:
-                d = http(f"https://mpstats.io/api/oz/get/item/{sku}/sales", MP_H, timeout=8, _tries=1)
-                rows = d if isinstance(d, list) else []
-                # MPStats отдаёт дни не по порядку. Целимся во ВЧЕРА (d_yest);
-                # если у MPStats его ещё нет (лаг) — берём самый свежий доступный.
-                rows = sorted((r for r in rows if r.get("ozon_card_price") or r.get("final_price")),
-                              key=lambda r: r.get("data", ""))
-                if rows:
-                    pick = next((r for r in rows if (r.get("data") or "")[:10] == d_yest), rows[-1])
-                    cp = pick.get("ozon_card_price") or pick.get("final_price")
-                    if cp: prices[str(sku)] = round(cp)
-            except Exception:
-                pass
+            # Аналитика отдаёт дни не по порядку. Целимся во ВЧЕРА (d_yest);
+            # если его ещё нет (лаг источника) — берём самый свежий доступный.
+            history = mp.history(sku)
+            if history:
+                day = d_yest if d_yest in history else max(history)
+                if history[day]:
+                    prices[str(sku)] = history[day]
             S["oz_cp_partial"] = prices; save()  # после каждого sku — против зависаний
         S["oz_client_price"] = {k: v for k, v in prices.items() if v}
         S.pop("oz_cp_partial", None); save()

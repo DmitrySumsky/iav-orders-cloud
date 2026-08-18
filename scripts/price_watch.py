@@ -117,6 +117,8 @@ card.wb.ru: `sizes[0].price.product / 100` = цена карточки, цена
 """
 import argparse, html, json, math, os, re, sys, time
 import urllib.request, urllib.parse, urllib.error
+
+from mpcore import states, wb_card
 from datetime import datetime, timezone, timedelta
 import jwt
 
@@ -549,32 +551,14 @@ def col_letter(i0):
 
 
 def wb_live(arts, tries=4):
-    """{артикул: цена с WB-Кошельком}. Нет в ответе = нет в наличии/удалён."""
-    out = {}
-    for k in range(0, len(arts), 100):
-        chunk = arts[k:k + 100]
-        url = "https://card.wb.ru/cards/v4/detail?" + urllib.parse.urlencode(
-            {"appType": 1, "curr": "rub", "dest": -1257786, "spp": 30, "nm": ";".join(chunk)})
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        for i in range(tries):
-            try:
-                with urllib.request.urlopen(req, timeout=40) as r:
-                    raw = r.read()
-                # на удалённый/скрытый артикул полка отвечает 200 с пустым телом
-                if not raw.strip():
-                    break
-                for p in json.loads(raw).get("products", []):
-                    pr = ((p.get("sizes") or [{}])[0].get("price") or {})
-                    prod = pr.get("product")
-                    if prod:
-                        out[str(p["id"])] = math.floor(prod / 100 * 0.98)
-                break
-            except Exception:
-                if i == tries - 1:
-                    print(f"  card.wb.ru: пачка {k // 100 + 1} не ответила — артикулы пропущены")
-                else:
-                    time.sleep(1.5 * (i + 1))
-    return out
+    """{артикул: цена с WB-Кошельком}. Нет в ответе = нет в наличии/удалён.
+
+    Обход витрины — в ядре (`mp-core`). Оно различает «нет в наличии» и
+    «нет карточки», но монитору эта разница не нужна: он сравнивает цены,
+    и отсутствие ключа для него уже означает «сравнивать нечего».
+    """
+    prices = wb_card.prices([str(a) for a in arts])
+    return {nm: value for nm, value in prices.items() if states.is_price(value)}
 
 
 def as_num(x):

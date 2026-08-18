@@ -1,6 +1,6 @@
 # Общее ядро сборщиков — ПО ТЕГУ, а не с ветки: коммит в ядро
 # не должен уронить всех потребителей разом.
-mp-core @ git+https://github.com/DmitrySumsky/mp-core@v0.1.0
+mp-core @ git+https://github.com/DmitrySumsky/mp-core@v0.4.0
 PyJWT
 cryptography
 pillow

@@ -1,0 +1,66 @@
+name: Долив пропущенных дат в таблицы цен
+
+# Зачем отдельно от ежедневного отчёта: отчёт большой, идёт под час и падает
+# целиком из-за любого своего шага. Долив дат — лёгкий и должен случиться
+# сразу, как только у платной аналитики обновится суточная квота; ждать
+# следующего утреннего прогона незачем.
+#
+# Сам долив живёт в логике `prices_update` (вставляет пропущенные дни внутрь
+# блока дат и заполняет), так что этот workflow ничего особенного не делает —
+# просто даёт ему шанс отработать несколько раз в сутки. Квоты нет — прогон
+# честно скажет об этом в журнале и завершится, ничего не испортив.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 21:10 UTC = 00:10 МСК — счётчик суточной квоты только что сброшен.
+    - cron: "10 21 * * *"
+    # 02:10 UTC = 05:10 МСК — вторая попытка до утреннего отчёта.
+    - cron: "10 2 * * *"
+
+concurrency:
+  group: prices-gaps
+  cancel-in-progress: false
+
+jobs:
+  gaps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Зависимости
+        run: pip install -r requirements.txt
+
+      - name: Секреты -> файлы
+        env:
+          API_KEYS: ${{ secrets.API_KEYS_FILE }}
+          API_KEYS_EXTRA: ${{ secrets.API_KEYS_EXTRA }}
+          SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
+        run: |
+          # tr -d '\r': секреты заливались с Windows, \r уезжал в конец
+          # значения ключа и ломал URL Sheets API
+          printf '%s' "$API_KEYS" | tr -d '\r' > api_keys.txt
+          printf '\n%s\n' "$API_KEYS_EXTRA" | tr -d '\r' >> api_keys.txt
+          printf '%s' "$SA_JSON" > google_sa.json
+
+      - name: Долив по всем книгам цен
+        run: |
+          IDS=$(grep -h '^PRICES_GSHEET_ID=' api_keys.txt | tail -1 | cut -d= -f2)
+          rc=0
+          for id in $(echo "$IDS" | tr ',' ' '); do
+            echo "=== книга $id ==="
+            # Книги перечислены по порядку приоритета: при нехватке квоты
+            # голодает последняя, и это должно быть видно в журнале.
+            python3 -u scripts/prices_update.py \
+              --keys api_keys.txt --sa google_sa.json --sheet-id "$id" || rc=1
+          done
+          exit $rc
+
+      - name: Убрать секреты
+        if: always()
+        run: rm -f api_keys.txt google_sa.json

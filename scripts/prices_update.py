@@ -1,6 +1,35 @@
 #!/usr/bin/env python3
-"""Отчёт по ценам WB + Ozon: ежедневное обновление таблицы «Аналитика цен»
-из MPStats (облачная версия скилла wb-ceny-konkurentov + Ozon-контур).
+"""ОТЧЁТ ПО ЦЕНАМ WB + Ozon v2.0.0 — 18.08.2026.
+
+Ежедневное обновление таблиц «Аналитика цен» (облачная версия скилла
+wb-ceny-konkurentov + Ozon-контур).
+
+История версий (новое сверху, старое не переписывать):
+
+v2.0.0 — 18.08.2026
+  ЦЕНЫ WB СТОЯЛИ ПЯТЬ СУТОК: У MPStats ВЫБРАНА СУТОЧНАЯ КВОТА ПО WB
+  (жалоба «таблица не обновляется» по книге автохимии VEXOR, 18.08.2026)
+  • WB получил резервный источник — публичный `card.wb.ru/cards/v4/detail`
+    (без ключа и без квоты). MPStats остаётся основным: он отдаёт закрытый
+    день и 30 дней истории. Резерв включается сам, когда MPStats не ответил
+    на пробы, и пишет цену «сейчас» в колонку за СЕГОДНЯ.
+  • Резерв НЕ заводит колонки за пропущенные дни: истории у card.wb.ru нет,
+    пустая колонка посреди блока дат уже никогда не заполнится.
+  • Товар без предложения резерв помечает словами «нет в наличии» / «нет
+    карточки», а не молчит: у MPStats на такой товар всё равно есть число
+    (последняя известная цена), и без пометки колонка выглядела бы дырявой
+    без объяснения. На автохимии это 80 строк из 374 — проверено по четырём
+    регионам, дело не в `dest`. Упавший батч не пишется вообще: дырка замера
+    не должна выглядеть как факт о товаре.
+  • Код 429 «Превышен лимит запросов за <дата>» больше не ретраится вместе
+    с 5xx и не маскируется под «MPStats не ответил»: до полуночи ответ не
+    изменится, а в логе теперь прямо написано про исчерпанный лимит.
+  • Ozon резерва не получил — публичного аналога card.wb.ru у него нет,
+    квота Ozon в MPStats считается отдельно от WB и не выбрана.
+  Сверка источников за 08–11.08.2026 по 280+ общим артикулам: расхождений
+  0–1 %. На 12.08 разошлись 52 из 284 ровно в отношении 1.25 и 1.43 — это
+  волна СПП (20 % и 30 %), см. проект 55: размер СПП задаёт склад отгрузки,
+  и «правильного» числа на весь день не существует ни у одного источника.
 
 Листы одной таблицы:
   - первый лист книги               — WB, цена wallet_price (с WB-Кошельком)
@@ -35,6 +64,30 @@ import jwt
 
 BASE = "https://sheets.googleapis.com/v4/spreadsheets/"
 FIRST_DATE_COL = 4  # D (1-based)
+
+# Резервный источник цены WB — публичная карточка WB (без ключа, без квоты).
+# Цена с WB-кошельком = floor(price.product / 100 * 0.98) — ровно та колонка,
+# которую ведут менеджеры (сверка с MPStats — см. историю версий, v2.0.0).
+CARD_URL = "https://card.wb.ru/cards/v4/detail"
+CARD_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"),
+    "Accept": "*/*",
+    "Origin": "https://www.wildberries.ru",
+    "Referer": "https://www.wildberries.ru/",
+}
+DEST_MOSCOW = "-1257786"
+WALLET_K = 0.98
+CARD_BATCH = 100        # больше 100 артикулов за запрос card.wb.ru не отдаёт
+
+# Три состояния, которые нельзя смешивать (та же логика, что в проекте 34):
+# цены нет, потому что товара нет в продаже; карточки нет вовсе; запрос не
+# прошёл. Последнее — дырка замера, а не факт о товаре, поэтому в таблицу не
+# пишется: ячейка остаётся такой, какой была.
+STATE_NONE = "нет в наличии"
+STATE_GONE = "нет карточки"
+
+MP_LIMIT = {"hit": False}   # взводится, когда MPStats ответил «превышен лимит»
 
 def load_keys(paths):
     d = {}
@@ -107,7 +160,19 @@ def mp_history(art, mp_token, mp_kind, field, tries=4):
             with urllib.request.urlopen(req, timeout=30) as r:
                 rows = json.loads(r.read()); break
         except urllib.error.HTTPError as e:
-            if e.code in (429, 500, 502, 503): time.sleep(1.0 * (i + 1)); continue
+            if e.code == 429:
+                # Суточная квота и минутный троттлинг у MPStats отвечают
+                # одинаково — 429; отличаем по телу. Квоту ретраить незачем:
+                # до полуночи ответ не изменится, а ретраи съедают прогон.
+                try:
+                    msg = json.loads(e.read() or b"{}").get("message", "")
+                except Exception:
+                    msg = ""
+                if "лимит" in msg.lower():
+                    MP_LIMIT["hit"] = True
+                    return {}
+                time.sleep(1.0 * (i + 1)); continue
+            if e.code in (500, 502, 503): time.sleep(1.0 * (i + 1)); continue
             return {}
         except Exception:
             time.sleep(0.7 * (i + 1))
@@ -116,6 +181,49 @@ def mp_history(art, mp_token, mp_kind, field, tries=4):
         for r in rows:
             d = r.get("data"); v = r.get(field) or r.get("final_price")
             if d and v: out[d] = round(v)
+    return out
+
+def wb_live_prices(arts):
+    """{артикул: цена с кошельком} с card.wb.ru, батчами по 100.
+
+    Резерв для WB, когда MPStats недоступен. Отдаёт цену «сейчас», а не
+    закрытый день, поэтому колонка пишется за СЕГОДНЯ. Артикул, которого нет
+    в ответе (карточка удалена) или без цены (нет в продаже), в словарь не
+    попадает — в таблице такая ячейка останется пустой, а не занулится.
+    """
+    out = {}
+    for i in range(0, len(arts), CARD_BATCH):
+        chunk = arts[i:i + CARD_BATCH]
+        ok = False
+        qs = urllib.parse.urlencode({"appType": "1", "curr": "rub", "spp": "30",
+                                     "dest": DEST_MOSCOW, "nm": ";".join(chunk)})
+        data = None
+        for attempt in range(4):
+            try:
+                req = urllib.request.Request(CARD_URL + "?" + qs, headers=CARD_HEADERS)
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    body = r.read()
+                # HTTP 200 с пустым телом — штатный ответ WB на мёртвые
+                # артикулы, а не сбой: ретраить нечего.
+                data = json.loads(body) if body.strip() else {}
+                ok = True
+                break
+            except Exception:
+                if attempt < 3: time.sleep(1.0 * (attempt + 1))
+        if not ok:
+            continue                      # батч не прошёл — молчим, а не врём
+        seen = set()
+        for p in (data or {}).get("products") or []:
+            nm = str(p["id"]); seen.add(nm)
+            kop = None
+            for size in p.get("sizes") or []:
+                pr = (size.get("price") or {}).get("product")
+                if pr: kop = pr; break
+            out[nm] = int(kop / 100 * WALLET_K) if kop else STATE_NONE  # int = floor
+        for nm in chunk:
+            if nm not in seen:
+                out[nm] = STATE_GONE
+        time.sleep(0.2)
     return out
 
 def as_int(x):
@@ -173,9 +281,25 @@ def process_tab(sheet_id, tok, props, mp_token, mp_kind, field, workers):
     for _, probe in arts[:5]:
         h = mp_history(probe, mp_token, mp_kind, field)
         if h: lat = max(h.keys()); break
-    if not lat:
-        return f"[{title}] MPStats не ответил на пробы"
-    lat = datetime.strptime(lat, "%Y-%m-%d").date()
+    live = None
+    if lat:
+        lat = datetime.strptime(lat, "%Y-%m-%d").date()
+    else:
+        why = ("исчерпал суточный лимит запросов" if MP_LIMIT["hit"]
+               else "не ответил на пробы")
+        if mp_kind != "wb":
+            return f"[{title}] MPStats {why}"
+        # WB: у публичной карточки WB ни ключа, ни квоты — берём цену оттуда.
+        live = wb_live_prices([a for _, a in arts])
+        n_price = sum(1 for v in live.values() if isinstance(v, int))
+        if not n_price:
+            return f"[{title}] MPStats {why}, card.wb.ru тоже не отдал цен"
+        lat = today
+        print(f"[{title}] MPStats {why} — беру живую цену с card.wb.ru: "
+              f"{n_price} цен из {len(arts)} артикулов "
+              f"(нет в наличии: {sum(1 for v in live.values() if v == STATE_NONE)}, "
+              f"нет карточки: {sum(1 for v in live.values() if v == STATE_GONE)}), "
+              f"колонка за {lat:%d.%m}")
 
     hdr = hdr0
     cols0 = date_cols(hdr, today, first=i_art + 1)
@@ -188,7 +312,8 @@ def process_tab(sheet_id, tok, props, mp_token, mp_kind, field, workers):
     tail0 = max((i for i, h in enumerate(hdr) if str(h).strip()), default=FIRST_DATE_COL - 2) + 1
     insert_at = min(cols0) if cols0 else max(FIRST_DATE_COL - 1, i_art + 1, tail0)
     kept = [str(h).strip() for h in hdr[:insert_at] if str(h).strip()]
-    print(f"[{title}] в таблице по {newest}, у MPStats по {lat}, строк {len(arts)}, "
+    src = "card.wb.ru" if live is not None else "MPStats"
+    print(f"[{title}] в таблице по {newest}, у {src} по {lat}, строк {len(arts)}, "
           f"блок дат с {col_letter(insert_at)}; ручные колонки слева "
           f"({len(kept)}): {', '.join(kept) or '—'}")
 
@@ -196,6 +321,12 @@ def process_tab(sheet_id, tok, props, mp_token, mp_kind, field, workers):
     d = lat
     while d > newest:
         missing.append(d); d -= timedelta(days=1)
+    if live is not None and len(missing) > 1:
+        # У card.wb.ru истории нет: колонки за пропущенные дни остались бы
+        # пустыми навсегда. Заводим только сегодняшнюю, дырка видна как дырка.
+        print(f"[{title}] пропущенные дни ({len(missing) - 1}) колонками не завожу — "
+              f"у card.wb.ru нет истории; догонит MPStats, когда вернётся квота")
+        missing = [lat]
     if missing:
         n = len(missing)
         api(sheet_id + ":batchUpdate", tok, "POST", {"requests": [
@@ -231,9 +362,15 @@ def process_tab(sheet_id, tok, props, mp_token, mp_kind, field, workers):
         if need: todo.append((r + 2, art, row))
     print(f"[{title}] к заливке: {len(todo)} строк")
 
+    lat_iso = lat.isoformat()
+
     def fetch(item):
         rownum, art, row = item
-        h = mp_history(art, mp_token, mp_kind, field)
+        if live is not None:
+            v = live.get(art)
+            h = {lat_iso: v} if v is not None else {}
+        else:
+            h = mp_history(art, mp_token, mp_kind, field)
         out = []
         for a, b in runs:
             vals = []
@@ -255,7 +392,7 @@ def process_tab(sheet_id, tok, props, mp_token, mp_kind, field, workers):
     for i in range(0, len(updates), 60):
         api(sheet_id + "/values:batchUpdate", tok, "POST",
             {"valueInputOption": "USER_ENTERED", "data": updates[i:i + 60]})
-    print(f"[{title}] залито ячеек: {filled}")
+    print(f"[{title}] залито ячеек: {filled} (источник: {src})")
     return None
 
 def main():

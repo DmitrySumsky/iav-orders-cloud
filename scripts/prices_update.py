@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
-"""ОТЧЁТ ПО ЦЕНАМ WB + Ozon v2.0.0 — 18.08.2026.
+"""ОТЧЁТ ПО ЦЕНАМ WB + Ozon v2.1.0 — 18.08.2026
+  ПРОПУЩЕННЫЕ ДНИ ПОЗАДИ СВЕЖЕЙ КОЛОНКИ НЕ ДОГОНЯЛИСЬ НИКОГДА
+  • Долив дыр ВНУТРИ блока дат: всё, что MPStats отдаёт в своём 30-дневном
+    окне и чего нет в шапке, вставляется колонкой на своё место по порядку
+    и заполняется. Обычная вставка идёт только слева (`while d > newest`) и
+    дни, оставшиеся позади самой свежей колонки, не видит — а остаться без
+    данных на несколько суток штатный случай (выбранная квота, упавший
+    прогон), поэтому долив обязан жить в логике, а не в разовом скрипте.
+  • Старее самой старой колонки книга не растёт: дыры берутся строго выше
+    её нижней границы. Выключается `--no-gap-fill`.
+  • Проверено на временном листе с искусственным пропуском 13–16.08
+    (контур Ozon, 12 боевых SKU): четыре колонки встали по порядку между
+    17.08 и 12.08, заполнены все 72 ячейки.
+
+v2.0.0 — 18.08.2026.
 
 Ежедневное обновление таблиц «Аналитика цен» (облачная версия скилла
 wb-ceny-konkurentov + Ozon-контур).
@@ -260,7 +274,7 @@ def runs_of(idxs):
         else: runs.append([i, i])
     return [(a, b) for a, b in runs]
 
-def process_tab(sheet_id, tok, props, mp_token, mp_kind, field, workers):
+def process_tab(sheet_id, tok, props, mp_token, mp_kind, field, workers, gaps=True):
     """Один лист: догнать даты + заполнить пустые. Возвращает None или ошибку."""
     title, gid = props["title"], props["sheetId"]
     q = "'" + title.replace("'", "''") + "'"; qurl = urllib.parse.quote(q)
@@ -277,10 +291,10 @@ def process_tab(sheet_id, tok, props, mp_token, mp_kind, field, workers):
         print(f"[{title}] нет строк с артикулами — пропуск"); return None
 
     # последняя дата у MPStats (проба по первым артикулам)
-    lat = None
+    lat, probe_hist = None, {}
     for _, probe in arts[:5]:
         h = mp_history(probe, mp_token, mp_kind, field)
-        if h: lat = max(h.keys()); break
+        if h: lat, probe_hist = max(h.keys()), h; break
     live = None
     if lat:
         lat = datetime.strptime(lat, "%Y-%m-%d").date()
@@ -339,6 +353,37 @@ def process_tab(sheet_id, tok, props, mp_token, mp_kind, field, workers):
                       "values": [[x.strftime('%d.%m') for x in missing]]}]})
         print(f"[{title}] добавлены даты: {[x.strftime('%d.%m') for x in missing]}")
 
+    # Дыры ВНУТРИ блока дат. Обычная вставка идёт только слева и пропущенные дни,
+    # оставшиеся позади свежей колонки, не догоняет никогда: `while d > newest`
+    # их не видит. А остаться без данных на несколько дней — штатный случай
+    # (выбранная квота, упавший прогон), поэтому долив обязан быть в самой
+    # логике, а не в разовом скрипте. Даты берём из окна MPStats (30 дней): всё,
+    # что он отдаёт и чего нет в шапке, а самой старой колонки книга не теряет.
+    holes = []
+    if gaps and live is None and probe_hist:
+        have = {datetime.strptime(v, "%Y-%m-%d").date() for v in cols0.values()}
+        have |= set(missing)
+        oldest = min(have) if have else lat
+        holes = sorted((datetime.strptime(d, "%Y-%m-%d").date() for d in probe_hist
+                        if datetime.strptime(d, "%Y-%m-%d").date() not in have
+                        and datetime.strptime(d, "%Y-%m-%d").date() > oldest))
+    for hole in holes:                       # от старой к новой: индексы не плывут
+        cur = api(f"{sheet_id}/values/{qurl}!A1:BZ1?valueRenderOption=FORMATTED_VALUE",
+                  tok).get("values", [[]])[0]
+        cmap = date_cols(cur, today, first=i_art + 1)
+        older = [c for c, iso in cmap.items()
+                 if datetime.strptime(iso, "%Y-%m-%d").date() < hole]
+        at = min(older) if older else max(cmap) + 1
+        api(sheet_id + ":batchUpdate", tok, "POST", {"requests": [
+            {"insertDimension": {"range": {"sheetId": gid, "dimension": "COLUMNS",
+                "startIndex": at, "endIndex": at + 1}, "inheritFromBefore": False}}]})
+        api(sheet_id + "/values:batchUpdate", tok, "POST", {"valueInputOption": "USER_ENTERED",
+            "data": [{"range": f"{q}!{col_letter(at)}1:{col_letter(at)}1",
+                      "values": [[hole.strftime('%d.%m')]]}]})
+    if holes:
+        print(f"[{title}] долив дыр внутри блока дат: "
+              f"{[x.strftime('%d.%m') for x in reversed(holes)]}")
+
     # полная заливка окна дат (существующее не затирается пустотой)
     hdr = api(f"{sheet_id}/values/{qurl}!A1:BZ1?valueRenderOption=FORMATTED_VALUE",
               tok).get("values", [[]])[0]
@@ -358,7 +403,8 @@ def process_tab(sheet_id, tok, props, mp_token, mp_kind, field, workers):
     for r, row in enumerate(data):
         art = row[i_art].strip() if len(row) > i_art else ""
         if not art.isdigit(): continue
-        need = missing or not str(row[newest_col] if len(row) > newest_col else "").strip()
+        need = (missing or holes
+                or not str(row[newest_col] if len(row) > newest_col else "").strip())
         if need: todo.append((r + 2, art, row))
     print(f"[{title}] к заливке: {len(todo)} строк")
 
@@ -401,6 +447,8 @@ def main():
     ap.add_argument("--sa", required=True)
     ap.add_argument("--sheet-id", required=True)
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--no-gap-fill", action="store_true",
+                    help="не доливать пропущенные дни внутри блока дат")
     a = ap.parse_args()
 
     K = load_keys(a.keys)
@@ -412,12 +460,14 @@ def main():
     sheets = sorted((s["properties"] for s in meta["sheets"]), key=lambda p_: p_.get("index", 0))
 
     errors = []
-    err = process_tab(a.sheet_id, tok, sheets[0], mp_token, "wb", "wallet_price", a.workers)
+    err = process_tab(a.sheet_id, tok, sheets[0], mp_token, "wb", "wallet_price",
+                      a.workers, gaps=not a.no_gap_fill)
     if err: errors.append(err)
     oz_tab = next((p_ for p_ in sheets if "ozon" in p_["title"].lower()
                    or "озон" in p_["title"].lower()), None)
     if oz_tab:
-        err = process_tab(a.sheet_id, tok, oz_tab, mp_token, "oz", "ozon_card_price", a.workers)
+        err = process_tab(a.sheet_id, tok, oz_tab, mp_token, "oz", "ozon_card_price",
+                          a.workers, gaps=not a.no_gap_fill)
         if err: errors.append(err)
     else:
         print("Листа Ozon нет — только WB")

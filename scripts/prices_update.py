@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""ОТЧЁТ ПО ЦЕНАМ WB + Ozon v2.1.0 — 18.08.2026
+"""ОТЧЁТ ПО ЦЕНАМ WB + Ozon v3.0.0 — 18.08.2026
+  ПЯТЬ КОПИЙ ОДНОГО КОДА В РАЗНЫХ ПРОЕКТАХ — ПЕРЕЕЗД НА ОБЩЕЕ ЯДРО mp-core
+  • Обход публичной витрины, клиент платной аналитики, разбор шапки листа,
+    ретраи и три состояния замера переехали в библиотеку `mpcore` (тег
+    v0.1.0, 42 теста). Здесь остался только сценарий: что и куда писать.
+  • Поведение не менялось намеренно: сверено с прежней версией на боевых
+    книгах — состав дат, ручные колонки, значения ячеек совпадают.
+  • Ставится по ТЕГУ, а не с ветки: коммит в ядро не должен уронить всех
+    потребителей разом.
+
+v2.1.0 — 18.08.2026
   ПРОПУЩЕННЫЕ ДНИ ПОЗАДИ СВЕЖЕЙ КОЛОНКИ НЕ ДОГОНЯЛИСЬ НИКОГДА
   • Долив дыр ВНУТРИ блока дат: всё, что MPStats отдаёт в своём 30-дневном
     окне и чего нет в шапке, вставляется колонкой на своё место по порядку
@@ -71,375 +81,166 @@ v2.0.0 — 18.08.2026
   python3 prices_update.py --keys api_keys.txt[,extra] --sa google_sa.json --sheet-id <ID>
 Печатает DONE при успехе.
 """
-import argparse, json, re, sys, time, urllib.request, urllib.parse, urllib.error
-from datetime import date, datetime, timedelta
+import argparse
+import re
+import sys
 from concurrent.futures import ThreadPoolExecutor
-import jwt
+from datetime import date
 
-BASE = "https://sheets.googleapis.com/v4/spreadsheets/"
-FIRST_DATE_COL = 4  # D (1-based)
+from mpcore import datesheet as ds
+from mpcore import mpstats, sheets, states, wb_card
 
-# Резервный источник цены WB — публичная карточка WB (без ключа, без квоты).
-# Цена с WB-кошельком = floor(price.product / 100 * 0.98) — ровно та колонка,
-# которую ведут менеджеры (сверка с MPStats — см. историю версий, v2.0.0).
-CARD_URL = "https://card.wb.ru/cards/v4/detail"
-CARD_HEADERS = {
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"),
-    "Accept": "*/*",
-    "Origin": "https://www.wildberries.ru",
-    "Referer": "https://www.wildberries.ru/",
-}
-DEST_MOSCOW = "-1257786"
-WALLET_K = 0.98
-CARD_BATCH = 100        # больше 100 артикулов за запрос card.wb.ru не отдаёт
-
-# Три состояния, которые нельзя смешивать (та же логика, что в проекте 34):
-# цены нет, потому что товара нет в продаже; карточки нет вовсе; запрос не
-# прошёл. Последнее — дырка замера, а не факт о товаре, поэтому в таблицу не
-# пишется: ячейка остаётся такой, какой была.
-STATE_NONE = "нет в наличии"
-STATE_GONE = "нет карточки"
-
-MP_LIMIT = {"hit": False}   # взводится, когда MPStats ответил «превышен лимит»
 
 def load_keys(paths):
-    d = {}
-    for p in paths.split(","):
-        p = p.strip()
-        if not p: continue
-        for line in open(p, encoding="utf-8"):
+    """Ключи из одного или нескольких файлов «КЛЮЧ=значение». Последний побеждает."""
+    out = {}
+    for path in paths.split(","):
+        path = path.strip()
+        if not path:
+            continue
+        for line in open(path, encoding="utf-8"):
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1); d[k.strip()] = v.strip()
-    return d
-
-def token_of(sa_path):
-    SA = json.load(open(sa_path, encoding="utf-8")); now = int(time.time())
-    a_ = jwt.encode({"iss": SA["client_email"], "scope": "https://www.googleapis.com/auth/spreadsheets",
-        "aud": "https://oauth2.googleapis.com/token", "iat": now, "exp": now + 3600},
-        SA["private_key"], algorithm="RS256")
-    body = urllib.parse.urlencode({"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-                                   "assertion": a_}).encode()
-    return json.loads(urllib.request.urlopen(urllib.request.Request(
-        "https://oauth2.googleapis.com/token", data=body), timeout=30).read())["access_token"]
-
-def api(path, tok, method="GET", body=None, tries=5):
-    data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(BASE + path, data=data,
-        headers={"Authorization": "Bearer " + tok, "Content-Type": "application/json"}, method=method)
-    for attempt in range(tries):
-        try:
-            with urllib.request.urlopen(req, timeout=60) as r:
-                return json.loads(r.read())
-        except urllib.error.HTTPError as e:
-            # 429/5xx у Google Sheets — транзиентные (сегодня утренний прогон
-            # упал на разовом 503); ретраим с backoff, 4xx (кроме 429) — сразу
-            if e.code in (429, 500, 502, 503, 504) and attempt < tries - 1:
-                time.sleep(min(30, 3 * (2 ** attempt))); continue
-            raise
-        except (urllib.error.URLError, TimeoutError, OSError):
-            if attempt < tries - 1:
-                time.sleep(min(30, 3 * (2 ** attempt))); continue
-            raise
-
-def col_letter(i0):
-    s, i = "", i0 + 1
-    while i:
-        i, r = divmod(i - 1, 26); s = chr(65 + r) + s
-    return s
-
-def hdr_to_iso(s, today):
-    s = s.strip()
-    for fmt in ("%d.%m.%Y", "%d.%m.%y", "%d.%m"):
-        try:
-            dt = datetime.strptime(s, fmt).date()
-            if fmt == "%d.%m":
-                y = today.year
-                if date(y, dt.month, dt.day) > today: y -= 1
-                return date(y, dt.month, dt.day).isoformat()
-            return dt.isoformat()
-        except ValueError:
-            continue
-    return None
-
-def mp_history(art, mp_token, mp_kind, field, tries=4):
-    """История цен MPStats: {iso_date: цена}. Пусто при недоступности."""
-    url = f"https://mpstats.io/api/{mp_kind}/get/item/{art}/sales"
-    req = urllib.request.Request(url, headers={"X-Mpstats-TOKEN": mp_token,
-                                               "Content-Type": "application/json"})
-    rows = None
-    for i in range(tries):
-        try:
-            with urllib.request.urlopen(req, timeout=30) as r:
-                rows = json.loads(r.read()); break
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
-                # Суточная квота и минутный троттлинг у MPStats отвечают
-                # одинаково — 429; отличаем по телу. Квоту ретраить незачем:
-                # до полуночи ответ не изменится, а ретраи съедают прогон.
-                try:
-                    msg = json.loads(e.read() or b"{}").get("message", "")
-                except Exception:
-                    msg = ""
-                if "лимит" in msg.lower():
-                    MP_LIMIT["hit"] = True
-                    return {}
-                time.sleep(1.0 * (i + 1)); continue
-            if e.code in (500, 502, 503): time.sleep(1.0 * (i + 1)); continue
-            return {}
-        except Exception:
-            time.sleep(0.7 * (i + 1))
-    out = {}
-    if isinstance(rows, list):
-        for r in rows:
-            d = r.get("data"); v = r.get(field) or r.get("final_price")
-            if d and v: out[d] = round(v)
+                key, value = line.split("=", 1)
+                out[key.strip()] = value.strip()
     return out
 
-def wb_live_prices(arts):
-    """{артикул: цена с кошельком} с card.wb.ru, батчами по 100.
-
-    Резерв для WB, когда MPStats недоступен. Отдаёт цену «сейчас», а не
-    закрытый день, поэтому колонка пишется за СЕГОДНЯ. Артикул, которого нет
-    в ответе (карточка удалена) или без цены (нет в продаже), в словарь не
-    попадает — в таблице такая ячейка останется пустой, а не занулится.
-    """
-    out = {}
-    for i in range(0, len(arts), CARD_BATCH):
-        chunk = arts[i:i + CARD_BATCH]
-        ok = False
-        qs = urllib.parse.urlencode({"appType": "1", "curr": "rub", "spp": "30",
-                                     "dest": DEST_MOSCOW, "nm": ";".join(chunk)})
-        data = None
-        for attempt in range(4):
-            try:
-                req = urllib.request.Request(CARD_URL + "?" + qs, headers=CARD_HEADERS)
-                with urllib.request.urlopen(req, timeout=30) as r:
-                    body = r.read()
-                # HTTP 200 с пустым телом — штатный ответ WB на мёртвые
-                # артикулы, а не сбой: ретраить нечего.
-                data = json.loads(body) if body.strip() else {}
-                ok = True
-                break
-            except Exception:
-                if attempt < 3: time.sleep(1.0 * (attempt + 1))
-        if not ok:
-            continue                      # батч не прошёл — молчим, а не врём
-        seen = set()
-        for p in (data or {}).get("products") or []:
-            nm = str(p["id"]); seen.add(nm)
-            kop = None
-            for size in p.get("sizes") or []:
-                pr = (size.get("price") or {}).get("product")
-                if pr: kop = pr; break
-            out[nm] = int(kop / 100 * WALLET_K) if kop else STATE_NONE  # int = floor
-        for nm in chunk:
-            if nm not in seen:
-                out[nm] = STATE_GONE
-        time.sleep(0.2)
-    return out
 
 def as_int(x):
-    x = re.sub(r"[^\d]", "", str(x))
-    return int(x) if x else ""
-
-def col_by(hdr, words, default):
-    """Индекс колонки по слову в шапке. Раскладка ищется ПО ИМЕНАМ, а не по
-    буквам: менеджеры заводят слева от дат свои колонки («Прогрев» и
-    «Прогрев к-во» в книге автохимии, 31.07.2026), и всё, что завязано на
-    «артикул = B», после этого читает не ту колонку."""
-    for i, h in enumerate(hdr):
-        if any(w in str(h).strip().lower() for w in words):
-            return i
-    return default
+    digits = re.sub(r"[^\d]", "", str(x))
+    return int(digits) if digits else ""
 
 
-def date_cols(hdr, today, first=None):
-    """{индекс колонки: iso-дата} по шапке — только там, где дата разобралась."""
-    lo = FIRST_DATE_COL - 1 if first is None else first
-    out = {}
-    for i, v in enumerate(hdr):
-        if i >= lo and str(v).strip():
-            iso = hdr_to_iso(str(v), today)
-            if iso: out[i] = iso
-    return out
+def process_tab(book, props, client, workers, gaps=True, live_fallback=False):
+    """Один лист: догнать даты, долить пропуски, заполнить пустое.
 
-def runs_of(idxs):
-    """Подряд идущие индексы -> список (начало, конец). Нужен, чтобы писать
-    только в датированные колонки и перепрыгивать чужие."""
-    runs = []
-    for i in sorted(idxs):
-        if runs and i == runs[-1][1] + 1: runs[-1][1] = i
-        else: runs.append([i, i])
-    return [(a, b) for a, b in runs]
-
-def process_tab(sheet_id, tok, props, mp_token, mp_kind, field, workers, gaps=True):
-    """Один лист: догнать даты + заполнить пустые. Возвращает None или ошибку."""
-    title, gid = props["title"], props["sheetId"]
-    q = "'" + title.replace("'", "''") + "'"; qurl = urllib.parse.quote(q)
+    Возвращает None или строку ошибки. Сценарий здесь, механика — в ядре.
+    """
+    title, tab_id = props["title"], props["sheetId"]
     today = date.today()
 
-    hdr0 = api(f"{sheet_id}/values/{qurl}!A1:BZ1?valueRenderOption=FORMATTED_VALUE",
-               tok).get("values", [[]])[0]
-    i_art = col_by(hdr0, ("артикул", "nmid", "sku"), 1)
-    rows = api(f"{sheet_id}/values/{qurl}!A2:{col_letter(i_art)}5000"
-               f"?valueRenderOption=FORMATTED_VALUE", tok).get("values", [])
-    arts = [(r + 2, row[i_art].strip()) for r, row in enumerate(rows)
-            if len(row) > i_art and row[i_art].strip().isdigit()]
-    if not arts:
-        print(f"[{title}] нет строк с артикулами — пропуск"); return None
+    header = book.header(title)
+    i_art = ds.find_column(header, ("артикул", "nmid", "sku"), default=1)
+    rows = book.values(title, f"A2:{ds.col_letter(i_art)}5000")
+    items = [(r + 2, row[i_art].strip()) for r, row in enumerate(rows)
+             if len(row) > i_art and row[i_art].strip().isdigit()]
+    if not items:
+        print(f"[{title}] нет строк с артикулами — пропуск")
+        return None
+    articles = [a for _, a in items]
 
-    # последняя дата у MPStats (проба по первым артикулам)
-    lat, probe_hist = None, {}
-    for _, probe in arts[:5]:
-        h = mp_history(probe, mp_token, mp_kind, field)
-        if h: lat, probe_hist = max(h.keys()), h; break
+    # Свежая дата источника: набор дат у него один на все позиции, поэтому
+    # хватает пробы по первым — и она же показывает, каких дней не хватает.
+    latest, probe = client.latest_date(articles)
     live = None
-    if lat:
-        lat = datetime.strptime(lat, "%Y-%m-%d").date()
-    else:
-        why = ("исчерпал суточный лимит запросов" if MP_LIMIT["hit"]
-               else "не ответил на пробы")
-        if mp_kind != "wb":
-            return f"[{title}] MPStats {why}"
-        # WB: у публичной карточки WB ни ключа, ни квоты — берём цену оттуда.
-        live = wb_live_prices([a for _, a in arts])
-        n_price = sum(1 for v in live.values() if isinstance(v, int))
-        if not n_price:
-            return f"[{title}] MPStats {why}, card.wb.ru тоже не отдал цен"
-        lat = today
-        print(f"[{title}] MPStats {why} — беру живую цену с card.wb.ru: "
-              f"{n_price} цен из {len(arts)} артикулов "
-              f"(нет в наличии: {sum(1 for v in live.values() if v == STATE_NONE)}, "
-              f"нет карточки: {sum(1 for v in live.values() if v == STATE_GONE)}), "
-              f"колонка за {lat:%d.%m}")
+    if latest is None:
+        why = client.why_silent()
+        if not live_fallback:
+            return f"[{title}] {why}"
+        # Публичная витрина не знает истории, но не знает и квоты.
+        live = wb_card.prices(articles)
+        prices_found = sum(1 for v in live.values() if states.is_price(v))
+        if not prices_found:
+            return f"[{title}] {why}, публичная витрина тоже не отдала цен"
+        latest = today
+        print(f"[{title}] {why} — беру живую цену с витрины: {prices_found} цен "
+              f"из {len(items)} артикулов "
+              f"(нет в наличии: {sum(1 for v in live.values() if v == states.STATE_NONE)}, "
+              f"нет карточки: {sum(1 for v in live.values() if v == states.STATE_GONE)}), "
+              f"колонка за {latest:%d.%m}")
 
-    hdr = hdr0
-    cols0 = date_cols(hdr, today, first=i_art + 1)
-    existing = [datetime.strptime(v, "%Y-%m-%d").date() for v in cols0.values()]
-    newest = max(existing) if existing else (lat - timedelta(days=1))
-    # вставляем ПЕРЕД первой датированной колонкой: всё, что человек завёл левее
-    # блока дат, остаётся на своём месте
-    # Дат ещё нет — встаём сразу за последней заполненной колонкой шапки, а не
-    # жёстко в D: иначе новая дата врезалась бы в середину ручного блока.
-    tail0 = max((i for i, h in enumerate(hdr) if str(h).strip()), default=FIRST_DATE_COL - 2) + 1
-    insert_at = min(cols0) if cols0 else max(FIRST_DATE_COL - 1, i_art + 1, tail0)
-    kept = [str(h).strip() for h in hdr[:insert_at] if str(h).strip()]
-    src = "card.wb.ru" if live is not None else "MPStats"
-    print(f"[{title}] в таблице по {newest}, у {src} по {lat}, строк {len(arts)}, "
-          f"блок дат с {col_letter(insert_at)}; ручные колонки слева "
-          f"({len(kept)}): {', '.join(kept) or '—'}")
+    cols0 = ds.date_columns(header, today, first=i_art + 1)
+    newest = max(cols0.values()) if cols0 else None
+    insert_at = ds.insert_position(header, cols0, i_art)
+    manual = [str(h).strip() for h in header[:insert_at] if str(h).strip()]
+    source = "витрина" if live is not None else "аналитика"
+    print(f"[{title}] в таблице по {newest}, у источника ({source}) по {latest}, "
+          f"строк {len(items)}, блок дат с {ds.col_letter(insert_at)}; "
+          f"ручные колонки слева ({len(manual)}): {', '.join(manual) or '—'}")
 
-    missing = []
-    d = lat
-    while d > newest:
-        missing.append(d); d -= timedelta(days=1)
+    missing = ds.missing_dates(newest, latest)
     if live is not None and len(missing) > 1:
-        # У card.wb.ru истории нет: колонки за пропущенные дни остались бы
-        # пустыми навсегда. Заводим только сегодняшнюю, дырка видна как дырка.
+        # Колонки за прошлые дни витрина заполнить не сможет никогда —
+        # пустая колонка посреди блока дат хуже видимой дырки.
         print(f"[{title}] пропущенные дни ({len(missing) - 1}) колонками не завожу — "
-              f"у card.wb.ru нет истории; догонит MPStats, когда вернётся квота")
-        missing = [lat]
+              f"у витрины нет истории; догонит аналитика, когда вернётся квота")
+        missing = [latest]
     if missing:
-        n = len(missing)
-        api(sheet_id + ":batchUpdate", tok, "POST", {"requests": [
-            {"insertDimension": {"range": {"sheetId": gid, "dimension": "COLUMNS",
-                "startIndex": insert_at, "endIndex": insert_at + n},
-                "inheritFromBefore": False}}]})
-        last_new = col_letter(insert_at + n - 1)
-        api(sheet_id + "/values:batchUpdate", tok, "POST", {"valueInputOption": "USER_ENTERED",
-            "data": [{"range": f"{q}!{col_letter(insert_at)}1:{last_new}1",
-                      "values": [[x.strftime('%d.%m') for x in missing]]}]})
-        print(f"[{title}] добавлены даты: {[x.strftime('%d.%m') for x in missing]}")
+        book.insert_columns(tab_id, insert_at, len(missing))
+        last = ds.col_letter(insert_at + len(missing) - 1)
+        book.update([{"range": sheets.a1(title, ds.col_letter(insert_at), last, 1),
+                      "values": [[d.strftime("%d.%m") for d in reversed(missing)]]}],
+                    raw=True)
+        print(f"[{title}] добавлены даты: "
+              f"{[d.strftime('%d.%m') for d in reversed(missing)]}")
 
-    # Дыры ВНУТРИ блока дат. Обычная вставка идёт только слева и пропущенные дни,
-    # оставшиеся позади свежей колонки, не догоняет никогда: `while d > newest`
-    # их не видит. А остаться без данных на несколько дней — штатный случай
-    # (выбранная квота, упавший прогон), поэтому долив обязан быть в самой
-    # логике, а не в разовом скрипте. Даты берём из окна MPStats (30 дней): всё,
-    # что он отдаёт и чего нет в шапке, а самой старой колонки книга не теряет.
     holes = []
-    if gaps and live is None and probe_hist:
-        have = {datetime.strptime(v, "%Y-%m-%d").date() for v in cols0.values()}
-        have |= set(missing)
-        oldest = min(have) if have else lat
-        holes = sorted((datetime.strptime(d, "%Y-%m-%d").date() for d in probe_hist
-                        if datetime.strptime(d, "%Y-%m-%d").date() not in have
-                        and datetime.strptime(d, "%Y-%m-%d").date() > oldest))
-    for hole in holes:                       # от старой к новой: индексы не плывут
-        cur = api(f"{sheet_id}/values/{qurl}!A1:BZ1?valueRenderOption=FORMATTED_VALUE",
-                  tok).get("values", [[]])[0]
-        cmap = date_cols(cur, today, first=i_art + 1)
-        older = [c for c, iso in cmap.items()
-                 if datetime.strptime(iso, "%Y-%m-%d").date() < hole]
-        at = min(older) if older else max(cmap) + 1
-        api(sheet_id + ":batchUpdate", tok, "POST", {"requests": [
-            {"insertDimension": {"range": {"sheetId": gid, "dimension": "COLUMNS",
-                "startIndex": at, "endIndex": at + 1}, "inheritFromBefore": False}}]})
-        api(sheet_id + "/values:batchUpdate", tok, "POST", {"valueInputOption": "USER_ENTERED",
-            "data": [{"range": f"{q}!{col_letter(at)}1:{col_letter(at)}1",
-                      "values": [[hole.strftime('%d.%m')]]}]})
+    if gaps and live is None:
+        have = set(cols0.values()) | set(missing)
+        holes = ds.gap_dates(have, client.available_dates(probe))
+    for hole in holes:                      # от старой к новой: индексы не плывут
+        current = ds.date_columns(book.header(title), today, first=i_art + 1)
+        at = ds.hole_position(current, hole)
+        book.insert_columns(tab_id, at, 1)
+        letter = ds.col_letter(at)
+        book.update([{"range": sheets.a1(title, letter, letter, 1),
+                      "values": [[hole.strftime("%d.%m")]]}], raw=True)
     if holes:
-        print(f"[{title}] долив дыр внутри блока дат: "
-              f"{[x.strftime('%d.%m') for x in reversed(holes)]}")
+        print(f"[{title}] долив пропусков внутри блока дат: "
+              f"{[d.strftime('%d.%m') for d in reversed(holes)]}")
 
-    # полная заливка окна дат (существующее не затирается пустотой)
-    hdr = api(f"{sheet_id}/values/{qurl}!A1:BZ1?valueRenderOption=FORMATTED_VALUE",
-              tok).get("values", [[]])[0]
-    col_iso = date_cols(hdr, today, first=i_art + 1)
-    lo, hi = min(col_iso), max(col_iso)
-    newest_col = max(col_iso, key=lambda c: col_iso[c])
-    last = col_letter(hi)
-    # чужие колонки внутри блока дат: пишем ВОКРУГ них, содержимое не трогаем
-    runs = runs_of(col_iso)
-    alien = [col_letter(c) for c in range(lo, hi + 1) if c not in col_iso]
+    col_dates = ds.date_columns(book.header(title), today, first=i_art + 1)
+    lo, hi = min(col_dates), max(col_dates)
+    newest_col = max(col_dates, key=lambda c: col_dates[c])
+    runs = ds.runs_of(col_dates)
+    alien = [ds.col_letter(c) for c in range(lo, hi + 1) if c not in col_dates]
     if alien:
         print(f"[{title}] колонки без даты внутри блока дат: {', '.join(alien)} "
               f"— не трогаем (заливка идёт {len(runs)} диапазонами)")
-    data = api(f"{sheet_id}/values/{qurl}!A2:{last}5000?valueRenderOption=FORMATTED_VALUE",
-               tok).get("values", [])
+
+    data = book.values(title, f"A2:{ds.col_letter(hi)}5000")
     todo = []
     for r, row in enumerate(data):
-        art = row[i_art].strip() if len(row) > i_art else ""
-        if not art.isdigit(): continue
-        need = (missing or holes
-                or not str(row[newest_col] if len(row) > newest_col else "").strip())
-        if need: todo.append((r + 2, art, row))
+        article = row[i_art].strip() if len(row) > i_art else ""
+        if not article.isdigit():
+            continue
+        empty = not str(row[newest_col] if len(row) > newest_col else "").strip()
+        if missing or holes or empty:
+            todo.append((r + 2, article, row))
     print(f"[{title}] к заливке: {len(todo)} строк")
 
-    lat_iso = lat.isoformat()
+    latest_iso = latest.isoformat()
 
     def fetch(item):
-        rownum, art, row = item
+        rownum, article, row = item
         if live is not None:
-            v = live.get(art)
-            h = {lat_iso: v} if v is not None else {}
+            value = live.get(article)
+            history = {latest_iso: value} if value is not None else {}
         else:
-            h = mp_history(art, mp_token, mp_kind, field)
+            history = client.history(article)
         out = []
         for a, b in runs:
-            vals = []
-            for ci in range(a, b + 1):
-                v = h.get(col_iso[ci])
-                if v is None:  # MPStats молчит — оставляем то, что уже в таблице
-                    v = as_int(row[ci]) if len(row) > ci else ""
-                vals.append(v if v is not None else "")
-            out.append((a, b, vals))
+            columns = list(range(a, b + 1))
+            values = ds.row_values(row, col_dates, history, columns=columns)
+            # Прежнее содержимое возвращается строкой из таблицы — приводим
+            # к числу, иначе ячейка меняет тип на ровном месте.
+            values = [as_int(v) if isinstance(v, str) and v.strip().isdigit() else v
+                      for v in values]
+            out.append((a, b, values))
         return rownum, out
 
     updates, filled = [], 0
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        for rownum, out in ex.map(fetch, todo):
-            for a, b, vals in out:
-                filled += sum(1 for v in vals if v != "")
-                updates.append({"range": f"{q}!{col_letter(a)}{rownum}:{col_letter(b)}{rownum}",
-                                "values": [vals]})
-    for i in range(0, len(updates), 60):
-        api(sheet_id + "/values:batchUpdate", tok, "POST",
-            {"valueInputOption": "USER_ENTERED", "data": updates[i:i + 60]})
-    print(f"[{title}] залито ячеек: {filled} (источник: {src})")
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for rownum, out in pool.map(fetch, todo):
+            for a, b, values in out:
+                filled += sum(1 for v in values if v != "")
+                updates.append({"range": sheets.a1(title, ds.col_letter(a),
+                                                   ds.col_letter(b), rownum),
+                                "values": [values]})
+    book.update(updates)
+    print(f"[{title}] залито ячеек: {filled} (источник: {source})")
     return None
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -449,32 +250,44 @@ def main():
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--no-gap-fill", action="store_true",
                     help="не доливать пропущенные дни внутри блока дат")
-    a = ap.parse_args()
+    args = ap.parse_args()
 
-    K = load_keys(a.keys)
-    mp_token = K.get("MPSTATS_TOKEN", "")
-    if not mp_token:
-        print("ERROR: нет MPSTATS_TOKEN"); sys.exit(1)
-    tok = token_of(a.sa)
-    meta = api(a.sheet_id + "?fields=sheets.properties(sheetId,title,index)", tok)
-    sheets = sorted((s["properties"] for s in meta["sheets"]), key=lambda p_: p_.get("index", 0))
+    keys = load_keys(args.keys)
+    token = keys.get("MPSTATS_TOKEN", "")
+    if not token:
+        print("ERROR: нет MPSTATS_TOKEN")
+        sys.exit(1)
+
+    book = sheets.Sheets(args.sheet_id, sheets.access_token(args.sa))
+    tabs = book.tabs()
+    gaps = not args.no_gap_fill
 
     errors = []
-    err = process_tab(a.sheet_id, tok, sheets[0], mp_token, "wb", "wallet_price",
-                      a.workers, gaps=not a.no_gap_fill)
-    if err: errors.append(err)
-    oz_tab = next((p_ for p_ in sheets if "ozon" in p_["title"].lower()
-                   or "озон" in p_["title"].lower()), None)
-    if oz_tab:
-        err = process_tab(a.sheet_id, tok, oz_tab, mp_token, "oz", "ozon_card_price",
-                          a.workers, gaps=not a.no_gap_fill)
-        if err: errors.append(err)
+    # Первый лист книги — WB. У него есть бесплатный резерв, поэтому квота
+    # платной аналитики не останавливает сбор.
+    wb_client = mpstats.Client(token, mpstats.KIND_WB)
+    err = process_tab(book, tabs[0], wb_client, args.workers,
+                      gaps=gaps, live_fallback=True)
+    if err:
+        errors.append(err)
+
+    ozon_tab = next((t for t in tabs if "ozon" in t["title"].lower()
+                     or "озон" in t["title"].lower()), None)
+    if ozon_tab:
+        # Отдельный клиент: квоты контуров считаются раздельно, и выбранная
+        # квота одной площадки не должна гасить соседнюю.
+        ozon_client = mpstats.Client(token, mpstats.KIND_OZON)
+        err = process_tab(book, ozon_tab, ozon_client, args.workers, gaps=gaps)
+        if err:
+            errors.append(err)
     else:
         print("Листа Ozon нет — только WB")
 
     if errors:
-        print("ОШИБКИ:", "; ".join(errors)); sys.exit(1)
+        print("ОШИБКИ:", "; ".join(errors))
+        sys.exit(1)
     print("DONE")
+
 
 if __name__ == "__main__":
     main()

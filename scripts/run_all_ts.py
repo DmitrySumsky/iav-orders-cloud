@@ -254,6 +254,23 @@ if K.get("SVOD_GSHEET_ID"):
     else:
         print("SA недоступен — свод пропущен"); st["Google-таблица"] = "нет SA"
 
+# цены WB по позициям в той же книге свода — читают «Маппинг позиций»,
+# поэтому идут ПОСЛЕ svod_report (он этот лист и дополняет за прогон)
+if K.get("SVOD_GSHEET_ID"):
+    print("\n=== Цены WB по позициям ===", flush=True)
+    st = STATUS.setdefault("Цены свода", {"Сбор данных": "—", "Google-таблица": "—",
+                                          "Telegram": "—", "Детали": ""})
+    if sa_valid():
+        r = run(["python3", f"{HERE}/svod_prices.py", "--keys", KEYS, "--sa", SA])
+        print((r.stdout + r.stderr).strip()[-1200:])
+        if "DONE" not in r.stdout:
+            failed["ЦЕНЫ СВОДА"] = "svod_prices"
+            st["Сбор данных"] = st["Google-таблица"] = "❌"
+        else:
+            st["Сбор данных"] = st["Google-таблица"] = "✅"
+    else:
+        print("SA недоступен — цены свода пропущены"); st["Google-таблица"] = "нет SA"
+
 # отчёт по ценам WB+Ozon (MPStats) — независим от брендовых отчётов
 if K.get("PRICES_GSHEET_ID"):
     print("\n=== Отчёт по ценам (MPStats) ===", flush=True)

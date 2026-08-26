@@ -20,9 +20,10 @@ v1.0.0 — 26.08.2026
   • Лимитер «Цены и скидки» общий НА КАБИНЕТ (10 запросов/6 с со всеми
     подключёнными сервисами) — ждём по заголовку `X-Ratelimit-Retry`, а не
     вслепую, и между кабинетами держим паузу.
-  • Один товар = несколько артикулов (FBS-двойник, бан-карточка): цена
-    берётся с ОСНОВНОГО артикула (`common.norm` срезает маркеры дублей),
-    расхождение цен внутри позиции печатается в лог.
+  • Один товар = несколько карточек (FBS-двойник, «(старая)», «Блок», бан):
+    цена берётся с ОСНОВНОЙ — `common.norm` срезает маркеры дублей, а слова
+    «стар/блок/бан» опускают карточку в приоритете. Расхождение цен внутри
+    позиции печатается в лог.
   • Артикул кабинета, которого нет в маппинге (нет заказов за 60 дней),
     не теряется — уходит в конец листа строкой со своим артикулом.
 
@@ -31,7 +32,7 @@ v1.0.0 — 26.08.2026
       [--sheet-id <ID>] [--dry-run]
 Печатает DONE при успехе.
 """
-import argparse, json, os, sys, time, urllib.error, urllib.parse, urllib.request
+import argparse, json, os, re, sys, time, urllib.error, urllib.parse, urllib.request
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -44,6 +45,8 @@ CUR = "Цены"
 HIST = "История цен"
 HIST_MAX = 60
 GOODS_URL = "https://discounts-prices-api.wildberries.ru/api/v2/list/goods/filter"
+# снятая с продажи карточка того же товара: цену берём НЕ с неё
+RETIRED = re.compile(r"стар|блок|бан", re.I)
 
 p = argparse.ArgumentParser()
 p.add_argument("--keys", required=True)
@@ -192,18 +195,22 @@ for disp in DISP:
         pos = by_offer.get(disp + "||" + vc)
         if not pos:
             extra.append((disp, vc, pr)); continue
-        main = art_norm(vc) == vc          # артикул без маркеров дубля
+        # у одной позиции бывает несколько карточек: FBS-двойник, «(старая)»,
+        # «Блок», бан-карточка. Цену берём с ОСНОВНОЙ; расхождение — в лог
+        rank = (art_norm(vc) == vc, not RETIRED.search(vc))
         prev = seen.get(pos)
-        if prev is None or (main and not prev[1]):
-            seen[pos] = (pr, main, vc)
-        elif prev[0][2] != pr[2] and prev[1] == main:
+        if prev is None or rank > prev[1]:
+            if prev is not None and prev[0][2] != pr[2]:
+                spread.append((disp, pos, vc, pr[2], prev[2], prev[0][2]))
+            seen[pos] = (pr, rank, vc)
+        elif prev[0][2] != pr[2]:
             spread.append((disp, pos, prev[2], prev[0][2], vc, pr[2]))
     for pos, (pr, _, _) in seen.items():
         cell[(pos, disp)] = pr
 
 print(f"позиций с ценой: {len({p for p, _ in cell})} | артикулов вне маппинга: {len(extra)}")
-for d, pos, v1, p1, v2, p2 in spread[:20]:
-    print(f"  ⚠ {d} «{pos}»: {v1} = {p1} ₽, {v2} = {p2} ₽ — взята первая")
+for d, pos, keep, pk, skip, ps in spread[:20]:
+    print(f"  ⚠ {d} «{pos}»: цена по «{keep}» = {pk} ₽, вторая карточка «{skip}» = {ps} ₽")
 if errors: print("Ошибки кабинетов:", "; ".join(errors))
 
 if a.dry_run:
